@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gymnasium>=1.2.0",
+    "minigrid>=3.0.0",
+    "numpy>=2.3.2",
+    "torch>=2.8.0",
+    "tyro>=0.9.27",
+    "matplotlib>=3.5.0",
+    "gym>=0.26.2",
+    "pillow>=11.3.0",
+    "pygame>=2.6.1",
+    "wandb>=0.21.1",
+    "minatar>=1.0.15",
+    "seaborn>=0.13.2",
+    "ipykernel>=6.30.1",
+]
