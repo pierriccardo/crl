@@ -1,4 +1,5 @@
 # Custom
+.DS_Store
 results/
 wandb/
 plots/
