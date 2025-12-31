@@ -137,18 +137,84 @@ class ContinualWorldEnv(gym.Env):
     def __init__(self, task="hammer-v1", render_mode=None):
         super().__init__()
         try:
-            from metaworld import ML1
-        except ImportError:
-            raise ImportError(
-                "metaworld is required for ContinualWorldEnv. "
-                "Install it with: pip install metaworld"
-            )
+            # MetaWorld V3 API: Import environment classes directly
+            # Convert task name from "hammer-v1" to "SawyerHammerEnvV3"
+            task_name = task.replace("-v1", "").replace("-v2", "").replace("-v3", "")
+            # Convert to class name format: "hammer" -> "SawyerHammerEnvV3"
+            # Handle special cases
+            task_mapping = {
+                "hammer": "SawyerHammerEnvV3",
+                "push": "SawyerPushEnvV3",
+                "door-open": "SawyerDoorEnvV3",
+                "door-close": "SawyerDoorCloseEnvV3",
+                "drawer-close": "SawyerDrawerCloseEnvV3",
+                "drawer-open": "SawyerDrawerOpenEnvV3",
+                "reach": "SawyerReachEnvV3",
+                "push-wall": "SawyerPushWallEnvV3",
+                "shelf-place": "SawyerShelfPlaceEnvV3",
+                "button-press": "SawyerButtonPressEnvV3",
+                "button-press-topdown": "SawyerButtonPressTopdownEnvV3",
+                "button-press-topdown-wall": "SawyerButtonPressTopdownWallEnvV3",
+                "peg-insert-side": "SawyerPegInsertionSideEnvV3",
+                "window-open": "SawyerWindowOpenEnvV3",
+                "window-close": "SawyerWindowCloseEnvV3",
+                "reach-wall": "SawyerReachWallEnvV3",
+                "push-back": "SawyerPushBackEnvV3",
+                "lever-pull": "SawyerLeverPullEnvV3",
+                "box-close": "SawyerBoxCloseEnvV3",
+                "hand-insert": "SawyerHandInsertEnvV3",
+            }
 
-        # Create ML1 environment with the specified task
-        ml1 = ML1(task)
-        self._env = ml1.train_classes[task]()
-        self._task = ml1.train_tasks[0]  # Use first training task
-        self._env.set_task(self._task)
+            class_name = task_mapping.get(task_name)
+            if class_name is None:
+                # Try to construct class name automatically
+                # "hammer" -> "SawyerHammerEnvV3"
+                parts = task_name.split("-")
+                camel_case = "".join(word.capitalize() for word in parts)
+                class_name = f"Sawyer{camel_case}EnvV3"
+
+            # Import the environment class
+            from metaworld.envs import __dict__ as env_dict
+            env_cls = env_dict.get(class_name)
+
+            if env_cls is None:
+                raise ValueError(
+                    f"Task '{task}' (class '{class_name}') not found in MetaWorld V3. "
+                    f"Available classes: {[k for k in env_dict.keys() if 'EnvV3' in k][:10]}"
+                )
+
+            # Create environment instance
+            self._env = env_cls()
+            # For V3 environments, we need to initialize _last_rand_vec before reset
+            # This is required for V3 environments to work properly
+            if hasattr(self._env, '_random_reset_space') and hasattr(self._env, '_last_rand_vec'):
+                # Sample a random task vector and set it as _last_rand_vec
+                # This initializes the environment's random state
+                self._env._last_rand_vec = self._env._random_reset_space.sample()
+            elif hasattr(self._env, 'sample_tasks'):
+                # Fallback for environments that have sample_tasks method
+                task_obj = self._env.sample_tasks(1)[0]
+                self._env.set_task(task_obj)
+
+        except (ImportError, AttributeError, ValueError) as e:
+            # Fallback to ML1 API (older versions or if V3 not available)
+            try:
+                from metaworld import ML1
+                ml1 = ML1(task)
+                self._env = ml1.train_classes[task]()
+                self._task = ml1.train_tasks[0]
+                self._env.set_task(self._task)
+            except ImportError:
+                raise ImportError(
+                    "metaworld is required for ContinualWorldEnv. "
+                    "Install it with: pip install metaworld"
+                )
+            except Exception as fallback_error:
+                raise ValueError(
+                    f"Failed to create MetaWorld environment for task '{task}'. "
+                    f"V3 error: {e}. ML1 fallback error: {fallback_error}. "
+                    f"Make sure the task name is correct for your MetaWorld version."
+                )
 
         self.render_mode = render_mode
         self.task_name = task
@@ -180,6 +246,11 @@ class ContinualWorldEnv(gym.Env):
                 self._env.random.seed(seed)
             except AttributeError:
                 pass
+
+        # For V3 environments, sample a new random task vector on each reset
+        # This ensures each episode has a different goal/task
+        if hasattr(self._env, '_random_reset_space') and hasattr(self._env, '_last_rand_vec'):
+            self._env._last_rand_vec = self._env._random_reset_space.sample()
 
         obs = self._env.reset()
         return obs.astype(np.float32), {}

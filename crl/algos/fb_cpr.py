@@ -23,7 +23,7 @@ from typing import Any, Dict, Tuple, List
 from collections.abc import Mapping
 
 from crl.buffers import DictBuffer, ZBuffer
-from crl.envs import make_continual_episodic_env, make_env
+from crl.envs import make_continual_episodic_env, make_env, get_task_sequence
 
 # ==================================================
 # Configs
@@ -163,7 +163,6 @@ class Config:
     compile: bool = False
     env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
     seed: int = 0
-    device: str = "cpu"
     num_episodes: int = 10**5
     buffer_size: int = 10**7
     exploration_update_freq: int = 100
@@ -1885,10 +1884,10 @@ if __name__ == "__main__":
     z = agent._model.sample_z(1, device=agent.device)  # Initialize
     from crl.buffers.metamotivo_buffers import TrajectoryBuffer
     replay_buffer: Dict[str, Any] = {
-        "train": DictBuffer(capacity=config.buffer_size, device=config.device),
+        "train": DictBuffer(capacity=config.buffer_size, device=agent.device),
         "expert_slicer": TrajectoryBuffer(
             capacity=config.buffer_size,
-            device=config.device,
+            device=agent.device,
             seq_length=config.model.seq_length,
         ),
     }
