@@ -251,8 +251,8 @@ def dtype_numpytotorch(np_dtype: Any) -> torch.dtype:
         return torch.float16
     elif np_dtype == np.float32:
         return torch.float32
-    elif np_dtype == np.float64:
-        return torch.float64
+    elif np_dtype == np.float32:
+        return torch.float32
     elif np_dtype == np.int16:
         return torch.int16
     elif np_dtype == np.int32:

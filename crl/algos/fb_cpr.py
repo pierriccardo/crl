@@ -19,11 +19,15 @@ import safetensors.torch
 from safetensors.torch import save_model as safetensors_save_model
 
 from tqdm import tqdm
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Optional
 from collections.abc import Mapping
 
-from crl.buffers import DictBuffer, ZBuffer
+from crl.buffers import DictBuffer, ZBuffer, TrajectoryBuffer
 from crl.envs import make_continual_episodic_env, make_env, get_task_sequence
+
+print("cuda available:", torch.cuda.is_available())
+print("device count:", torch.cuda.device_count())
+print("current device:", torch.cuda.current_device() if torch.cuda.is_available() else None)
 
 # ==================================================
 # Configs
@@ -163,9 +167,14 @@ class Config:
     compile: bool = False
     env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
     seed: int = 0
-    num_episodes: int = 10**5
-    buffer_size: int = 10**7
-    exploration_update_freq: int = 100
+    num_episodes: int = 10**4
+    buffer_size: int = 3 * 10**3
+
+    # Exploration configuration for epistemically-guided exploration (FBEE)
+    exploration_update_freq: int = 5
+    exploration_num_z_samples: int = 30  # Number of candidate z's to evaluate for uncertainty-based exploration
+    exploration_num_obs: int = 1000  # Number of observations to sample and aggregate uncertainty over
+    exploration_f_uncertainty: bool = False  # If True, use F-uncertainty (trace of cov); else use Q-uncertainty (std)
     # eval
     eval_freq: int = 1000  # episodes
     train_freq: int = 2  # episodes
@@ -1804,7 +1813,7 @@ def eval(agent, config, t):
             task=task,
         )
         num_ep = config.num_eval_episodes
-        total_reward = np.zeros((num_ep,), dtype=np.float64)
+        total_reward = np.zeros((num_ep,), dtype=np.float32)
         for ep in range(num_ep):
             obs, _ = eval_env.reset()
             terminated = truncated = False
@@ -1825,6 +1834,157 @@ def eval(agent, config, t):
         }
         if config.use_wandb:
             wandb.log({f"eval/{task}/{k}": v for k, v in metrics.items()}, step=t)
+
+"""
+Utility: select_exploratory_z
+
+This function implements epistemically-guided exploration for forward-backward representations
+as described in "Epistemically-guided forward-backward exploration" (Armengol Urpí et al., 2025).
+Paper: https://arxiv.org/pdf/2507.05477
+Original code: https://github.com/nuria95/fbee/blob/main/url_benchmark/agent/fb_ddpg.py
+
+The function selects an exploratory latent goal z by maximizing epistemic uncertainty:
+- If sampling=True:
+  * Samples `num_z_samples` candidate z's from the prior
+  * Computes actions for each z via the agent's actor
+  * Queries the ensemble forward_map to obtain ensemble predictions
+  * Computes an epistemic-uncertainty score per candidate z:
+    - If f_uncertainty=True: trace-of-covariance of forward outputs F
+    - If f_uncertainty=False: std across ensemble of Q-values (Q = F · z)
+  * Returns the z with the highest epistemic score
+
+- If sampling=False: falls back to sampling a single random z
+
+The function is adapted to work directly with FBcprAgent, using:
+- agent._model.forward_map() for ensemble predictions (returns num_parallel x batch x z_dim)
+- agent._model.actor() for action computation (returns distribution with .mean)
+- agent._model.sample_z() for z sampling
+
+Example cfg:
+cfg = {
+    "sampling": True,
+    "num_z_samples": 100,
+    "f_uncertainty": False,  # Use Q-uncertainty (std of Q-values) instead of F-uncertainty
+}
+"""
+
+
+
+def select_exploratory_z(
+    obs: np.ndarray,
+    agent: FBcprAgent,
+    cfg: Dict[str, Any],
+) -> np.ndarray:
+    """
+    Select an exploratory latent goal z using ensemble disagreement (FBEE method).
+
+    Based on: https://arxiv.org/pdf/2507.05477
+    Adapted from: https://github.com/nuria95/fbee/blob/main/url_benchmark/agent/fb_ddpg.py
+
+    Args:
+        obs: observation(s) - can be single observation (1D numpy array) or batch (N x obs_dim).
+             If single observation, uncertainty is computed for that observation.
+             If batch, uncertainty is aggregated (mean) across observations for each candidate z.
+        agent: FBcprAgent instance with forward_map ensemble and actor
+        cfg: dictionary with keys:
+            - sampling (bool): if True, sample multiple z candidates and select by uncertainty
+            - num_z_samples (int): number of candidate z's to sample when sampling=True
+            - f_uncertainty (bool): if True, use trace-of-covariance of F; else use Q-value std
+            - norm_z (bool): whether to normalize z (usually True, handled by agent._model.project_z)
+        device: 'cuda' or 'cpu' (optional, defaults to agent.device)
+        std_for_actor: std for actor when computing actions (optional, defaults to agent._model.cfg.actor_std)
+
+    Returns:
+        selected_z: numpy array shape (1, z_dim) containing the chosen exploratory z.
+    """
+
+    # Convert obs to tensor and place on device. Handle both single obs and batch.
+    if isinstance(obs, np.ndarray):
+        obs_t = torch.as_tensor(obs, device=agent.device, dtype=torch.float32)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)  # (obs_dim,) -> (1, obs_dim)
+    elif isinstance(obs, torch.Tensor):
+        obs_t = obs.to(device=device, dtype=torch.float32)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)  # (obs_dim,) -> (1, obs_dim)
+    else:
+        raise TypeError("obs must be numpy array or torch.Tensor")
+
+    num_obs = obs_t.shape[0]  # Number of observations to aggregate over
+
+    # Sample candidate z's
+    z_all = agent._model.sample_z(config.exploration_num_z_samples, device=agent.device)  # config.exploration_num_z_samples x z_dim
+    z_all = z_all.to(dtype=torch.float32)
+
+    # Process candidates in batches to avoid OOM
+    batch_size = min(32, config.exploration_num_z_samples)  # Process in smaller batches
+    epistemic_scores_list = []
+
+    with torch.no_grad():
+        for batch_start in range(0, config.exploration_num_z_samples, batch_size):
+            batch_end = min(batch_start + batch_size, config.exploration_num_z_samples)
+            z_batch = z_all[batch_start:batch_end]  # batch_size x z_dim
+            num_batch = z_batch.shape[0]
+
+            # Expand obs and z to compute uncertainty for all (obs, z) pairs
+            # obs_t: (num_obs, obs_dim), z_batch: (num_batch, z_dim)
+            # We want to evaluate each z with each observation
+            obs_expanded = obs_t.unsqueeze(1).expand(-1, num_batch, -1)  # (num_obs, num_batch, obs_dim)
+            z_expanded = z_batch.unsqueeze(0).expand(num_obs, -1, -1)  # (num_obs, num_batch, z_dim)
+
+            # Flatten to process all pairs together
+            obs_flat = obs_expanded.reshape(-1, obs_t.shape[1])  # (num_obs * num_batch, obs_dim)
+            z_flat = z_expanded.reshape(-1, z_batch.shape[1])  # (num_obs * num_batch, z_dim)
+
+            # Compute deterministic action means for each (obs, z) pair
+            dist = agent._model.actor(obs_flat, z_flat, agent._model.cfg.actor_std)
+            acts = dist.mean.to(dtype=torch.float32)  # (num_obs * num_batch, action_dim)
+
+            # Query forward_map: returns shape (num_parallel, num_obs * num_batch, z_dim)
+            F1_flat = agent._model.forward_map(obs_flat, z_flat, acts)  # num_parallel x (num_obs * num_batch) x z_dim
+
+            # Ensure F1 has ensemble dimension
+            if F1_flat.dim() == 3:
+                # Reshape back to separate obs and z dimensions
+                F1_reshaped = F1_flat.reshape(F1_flat.shape[0], num_obs, num_batch, F1_flat.shape[2])  # num_parallel x num_obs x num_batch x z_dim
+
+                # Compute epistemic scores for each candidate z, aggregated across observations
+                z_scores = []  # Will store scores for each z candidate
+                for z_idx in range(num_batch):
+                    # Get F predictions for this z across all observations: (num_parallel, num_obs, z_dim)
+                    F1_z = F1_reshaped[:, :, z_idx, :]
+
+                    if config.exploration_f_uncertainty:
+                        # Compute trace-of-covariance for each observation, then aggregate
+                        traces_per_obs = []
+                        for obs_idx in range(num_obs):
+                            mat = F1_z[:, obs_idx, :].transpose(0, 1)  # z_dim x num_parallel
+                            cov = torch.cov(mat)
+                            traces_per_obs.append(torch.trace(cov).item())
+                        # Aggregate: mean uncertainty across observations for this z
+                        z_scores.append(np.mean(traces_per_obs))
+                    else:
+                        # Compute Q-values: Q = sum(F * z, dim=-1) per ensemble member
+                        z_candidate = z_batch[z_idx]  # (z_dim,)
+                        # F1_z: (num_parallel, num_obs, z_dim), z_candidate: (z_dim,)
+                        Q1_z = torch.einsum('noz, z -> no', F1_z, z_candidate)  # num_parallel x num_obs
+                        # Aggregate: mean std across observations for this z
+                        std_per_obs = Q1_z.std(dim=0)  # (num_obs,)
+                        z_scores.append(std_per_obs.mean().item())
+
+                epistemic_scores_list.append(torch.as_tensor(z_scores, device=agent.device, dtype=torch.float32))
+            else:
+                # Unexpected shape: use zero scores for this batch
+                epistemic_scores_list.append(torch.zeros(num_batch, device=agent.device, dtype=torch.float32))
+
+    # Concatenate all batch scores
+    epistemic_scores = torch.cat(epistemic_scores_list)  # num_zs
+
+    # Choose argmax
+    idx = int(torch.argmax(epistemic_scores).cpu().item())
+    selected_z = z_all[idx].cpu().numpy()  # shape: (z_dim,)
+    # Return with batch dimension to match sample_z(1, ...) which returns (1, z_dim)
+    return selected_z[np.newaxis, :]  # shape: (1, z_dim)
 
 
 if __name__ == "__main__":
@@ -1881,8 +2041,8 @@ if __name__ == "__main__":
 
     agent = FBcprAgent(**dataclasses.asdict(config))
 
-    z = agent._model.sample_z(1, device=agent.device)  # Initialize
-    from crl.buffers.metamotivo_buffers import TrajectoryBuffer
+    z = agent._model.sample_z(1, device=agent.device)  # Initialize z
+
     replay_buffer: Dict[str, Any] = {
         "train": DictBuffer(capacity=config.buffer_size, device=agent.device),
         "expert_slicer": TrajectoryBuffer(
@@ -1892,8 +2052,9 @@ if __name__ == "__main__":
         ),
     }
 
-    # Store last episode (next_obs, reward) and reward
+    # Store last window_size episode (next_obs, reward) and reward
     # for quick z inference and to compute regret
+    window_size: int = 5  # number of last episodes to store.
     nextobs_buffer: List[torch.Tensor] = []
     rewards_buffer: List[float] = []
 
@@ -1906,33 +2067,32 @@ if __name__ == "__main__":
         # --------------------------------------------------
         # Exploration (choosing z to act in this episode)
         # --------------------------------------------------
-        if episode % config.exploration_update_freq == 0:
+        if len(nextobs_buffer) > config.exploration_num_obs:
+            if  episode % config.exploration_update_freq == 0:
+                # Use nextobs_buffer (observations from current task) for task-specific exploration
+                # This focuses exploration on the current task being solved
+                with torch.no_grad(), eval_mode(agent._model):
+                    # Use observations from nextobs_buffer (current task)
+                    # Take the most recent observations
+                    obs_tensors = nextobs_buffer[-config.exploration_num_obs:]
+                    exploration_obs = torch.stack(obs_tensors).cpu().to(dtype=torch.float32).numpy()  # (num_obs, obs_dim)
 
-            # Option A: Random exploration
-            z = agent._model.sample_z(1, device=agent.device)
-
-            # Option B: Sample from z_buffer (if using mix_rollout)
-            # if not agent.z_buffer.empty():
-            #     z = agent.z_buffer.sample(1, device=agent.device)
-
-            # Option C: Task-aware exploration (encode current task/goal)
-            # current_goal = info.get('goal')  # if available
-            # if current_goal is not None:
-            #     z = agent._model.backward_map(
-            #         torch.as_tensor(current_goal, device=agent.device).unsqueeze(0)
-            #     )
-            #     z = agent._model.project_z(z)
-        else:
-            # compute z from past interactions
-            if len(nextobs_buffer) == 0:
-                z = agent._model.sample_z(1, device=agent.device)
-            else:
+                    z_exploration = select_exploratory_z(
+                        obs=exploration_obs,
+                        agent=agent,
+                        cfg=config,
+                    )
+                    z = torch.as_tensor(z_exploration, device=agent.device, dtype=torch.float32)
+            else:  # Exploitation
                 with torch.no_grad(), eval_mode(agent._model):
                     next_obs_tensor = torch.stack(nextobs_buffer).to(agent.device)
                     reward_tensor = torch.tensor(
                         rewards_buffer, dtype=torch.float32, device=agent.device
                     ).reshape(-1, 1)
                     z = agent._model.reward_inference(next_obs=next_obs_tensor, reward=reward_tensor)
+        else:
+            # Fallback to random exploration if not enough data
+            z = agent._model.sample_z(1, device=agent.device)
 
         # --------------------------------------------------
         # Evaluation
@@ -1959,10 +2119,10 @@ if __name__ == "__main__":
 
         terminated = truncated = False
         episode_reward = 0.0
+        # Collect episode data
         episode_transitions = []
 
         while not (terminated or truncated):
-
             action_tensor = agent.act(
                 torch.as_tensor(obs, device=agent.device, dtype=torch.float32).unsqueeze(0),
                 z,
@@ -1972,18 +2132,40 @@ if __name__ == "__main__":
             next_obs, reward, terminated, truncated, info = env.step(action)
 
             episode_reward += reward
+            # TODO: probably nextobs_buffer should contains only last non-exploratory data?
             nextobs_buffer.append(torch.from_numpy(next_obs).float())
             rewards_buffer.append(reward)
 
+            # Ensure z has shape (1, z_dim) - it might be (z_dim,) from reward_inference
+            z_np = z.cpu().numpy().astype(np.float32)
+            if z_np.ndim == 1:
+                z_np = z_np[np.newaxis, :]  # Add batch dimension: (z_dim,) -> (1, z_dim)
+            # z_np should now be (1, z_dim)
+
+            # Ensure all arrays have shape (1, feature_dim) for consistent buffer handling
+            # This prevents shape mismatches when the buffer wraps around
+            def ensure_2d(arr, is_scalar=False):
+                """Ensure array has shape (1, feature_dim)"""
+                arr = np.asarray(arr)
+                if is_scalar or arr.ndim == 0:
+                    # Scalar: reshape to (1, 1)
+                    return arr.reshape(1, 1)
+                elif arr.ndim == 1:
+                    # 1D array: add batch dimension (1, feature_dim)
+                    return arr[np.newaxis, :]
+                else:
+                    # Already 2D or more: should be (1, feature_dim)
+                    return arr
+
             data = {
-                "observation": np.array([obs], dtype=np.float32),
-                "action": np.array([action], dtype=np.float32),
-                "z": z.cpu().numpy(),
+                "observation": ensure_2d(obs),
+                "action": ensure_2d(action),
+                "z": z_np,  # Already (1, z_dim)
                 "next": {
-                    "observation": np.array([next_obs], dtype=np.float32),
-                    "terminated": np.array([terminated or truncated], dtype=np.bool_),
+                    "observation": ensure_2d(next_obs),
+                    "terminated": ensure_2d(terminated or truncated, is_scalar=True),
                 },
-                "reward": np.array([reward], dtype=np.float32),
+                "reward": ensure_2d(reward, is_scalar=True),
             }
             replay_buffer["train"].extend(data)
             episode_transitions.append(data)
@@ -2018,6 +2200,13 @@ if __name__ == "__main__":
                 "metrics/task_name": current_task,   # Task name for reference
             }, step=episode)
 
-        nextobs_buffer.clear()
-        rewards_buffer.clear()
+        if episode % window_size == 0:
+            # After window_size episode clear the buffers
+            if config.use_wandb:
+                wandb.log({
+                    "debug/len_nextobs_buffer": len(nextobs_buffer),
+                    "debug/len_episode": len(episode_dict["observation"])
+                }, step=episode)
+            nextobs_buffer.clear()
+            rewards_buffer.clear()
 
