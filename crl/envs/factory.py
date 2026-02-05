@@ -1,17 +1,45 @@
 # crl/envs/factory.py
 from __future__ import annotations
-
+import itertools
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
-from gymnasium.wrappers import RecordEpisodeStatistics
+
+from minigrid.wrappers import FlatObsWrapper
+from minigrid.core.actions import Actions
+
+from minihack import RewardManager
+from minihack.reward_manager import Event
+from crl.envs.adapters import DenseCoordEvent, lvl_gen
+
+import metaworld
+from metaworld.envs import (
+    SawyerReachEnvV3,
+    SawyerDrawerCloseEnvV3,
+    SawyerHammerEnvV3
+)
 
 # Environments, adapters and wrappers
-from crl.envs.gridenv import GoalEnv
-from crl.envs.adapters import DMControlEnv, ContinualWorldEnv
-from crl.envs.wrappers import ImageWrapper, ActionWrapper, ContinualEpisodicWrapper
+from crl.envs.adapters import MultiTaskGridEnv, DMControlEnv, SimpleDistAsTaskEnv
+from crl.envs.tasks import (
+    PARKING_DISTS_SPECS,
+    PARKING_TASKS_SPECS,
+    SYNTHETIC_DISTS_SPECS,
+    HUMANOID_TASK_BY_NAME,
+)
+from crl.envs.wrappers import (
+    ReduceActions,
+    ContinualEpisodicWrapper,
+    FloatObsWrapper,
+    FlattenObsWrapper,
+    ImageWrapper,
+    DictToVectorObs,
+    MetaworldTaskSwitcher,
+    HighwayParkingDistWrapper,
+    VectorizeObsWrapper,
+    HumanoidTaskWrapper,
+)
 
 from typing import Callable, Dict, Any, Optional
-
 
 # --- registry of callables returning a fresh env (unwrapped) ---
 _REGISTRY: Dict[str, Callable[..., gym.Env]] = {}
@@ -42,52 +70,191 @@ def _register_task_sequence(env_name: str, sequence_name: str, task_list: list[s
 # Single task environments
 # ============================================
 
-@_register("goalenv")
-def _goal_env(**kwargs) -> gym.Env:
+@_register("switchingdist")
+def _driftw_env(**kwargs) -> gym.Env:
+    # Use SYNTHETIC_DISTS_SPECS as default if dist_specs not provided
+    if "dist_specs" not in kwargs:
+        kwargs["dist_specs"] = SYNTHETIC_DISTS_SPECS
+    return SimpleDistAsTaskEnv(**kwargs)
+
+
+@_register("minigrid")
+def _multitaskgrid_env(**kwargs) -> gym.Env:
     """Single task goal environment with configurable task."""
     # Extract task parameter
-    task = kwargs.pop('task', 'north')  # Default to 'north' task
+    task = kwargs.pop('task', None)
 
-    # Create GoalEnv with specified task
-    env = GoalEnv(task=task, **kwargs)
+    if task is None:
+        task = "reachgreen"
 
-    # Apply standard wrappers
-    env = ImageWrapper(env)
-    env = ActionWrapper(env=env, action_subset=[0, 1, 2])
+    env = MultiTaskGridEnv(task_name=task, **kwargs)
+
+    allowed = [Actions.left, Actions.right, Actions.forward, Actions.pickup]
+    env = ReduceActions(env=env, allowed=allowed)
+
+    env = ImageWrapper(env=env)
+    env = FlattenObsWrapper(env=env)
+    env = FloatObsWrapper(env=env)
+
     return env
 
 
 @_register("dmcontrol")
 def _dmcontrol_env(**kwargs) -> gym.Env:
     """DeepMind Control Suite environment with configurable domain and task."""
-    # Extract domain and task parameters
-    # Task format can be "domain/task" or separate domain and task params
     task = kwargs.pop('task', None)
     domain = kwargs.pop('domain', None)
 
-    # Parse task if it's in "domain/task" format
-    if task and '/' in task:
-        domain, task = task.split('/', 1)
-
-    # Set defaults
     if domain is None:
         domain = 'cartpole'
     if task is None:
         task = 'swingup'
 
-    # Create DMControlEnv with specified domain and task
+    kwargs.pop("max_episode_steps", None)
+    kwargs.pop("_continual_task_list_len", None)
+    kwargs.pop("seed", None)  # DMControlEnv has no seed in __init__; make_env seeds via reset()
     env = DMControlEnv(domain=domain, task=task, **kwargs)
     return env
 
 
-@_register("continualworld")
-def _continualworld_env(**kwargs) -> gym.Env:
-    """Continual World (MetaWorld) environment with configurable task."""
-    # Extract task parameter
-    task = kwargs.pop('task', 'hammer-v1')  # Default to hammer-v1
+@_register("minihack")
+def _minihack_env(**kwargs) -> gym.Env:
+    task = kwargs.pop('task', None)
+    max_episode_steps = kwargs.pop("max_episode_steps", None)
+    coordinates = task.split("_")[1:]
+    coordinates = tuple(int(c) for c in coordinates)
 
-    # Create ContinualWorldEnv with specified task
-    env = ContinualWorldEnv(task=task, **kwargs)
+    rm = RewardManager()
+    rm.add_event(DenseCoordEvent(coordinates=coordinates))
+
+    make_kwargs = dict(
+        des_file=lvl_gen.get_des(),
+        observation_keys=("glyphs_crop", "blstats"),
+        reward_manager=rm,
+    )
+    if max_episode_steps is not None:
+        make_kwargs["max_episode_steps"] = max_episode_steps
+    env = gym.make("MiniHack-Skill-Custom-v0", **make_kwargs)
+
+    env = DictToVectorObs(env, keys=["blstats"])
+
+    return env
+
+
+@_register("metaworld")
+def _metaworld_env(**kwargs) -> gym.Env:
+    # env_id is "metaworld/<env_name>" e.g. metaworld/reach-v3
+    env_id = kwargs.pop("env_id", "metaworld/reach-v3")
+    env_name = env_id.split("/", 1)[1]
+    assert env_name in ["reach-v3", "drawer-close-v3", "hammer-v3"], f"Unknown environment name: {env_name}"
+
+    # _continual_task_list_len: in continual mode we take that many tasks (task ids "0".."n-1").
+    # task: initial task index (e.g. "0") when creating a single env for eval; do NOT slice tasks by it.
+    n_tasks = kwargs.get("_continual_task_list_len")
+    task_param = kwargs.pop("task", None)
+    seed = kwargs.pop("seed", None)
+    if seed is None:
+        seed = 0  # MT1 expects int; use 0 so benchmark is at least deterministic
+
+    envs = {
+        "reach-v3": SawyerReachEnvV3(),
+        "drawer-close-v3": SawyerDrawerCloseEnvV3(),
+        "hammer-v3": SawyerHammerEnvV3(),
+    }
+
+    assert env_name in envs.keys(), f"Unknown environment name: {env_name}"
+
+    benchmark = metaworld.MT1(env_name, seed=seed)
+    tasks = [t for t in benchmark.train_tasks if t.env_name == env_name]
+    if n_tasks is not None:
+        tasks = tasks[:n_tasks]
+    # else: use all tasks (e.g. 50); task_param is only the initial task index for set_task
+
+    if not tasks:
+        raise ValueError(f"MetaWorld benchmark produced no tasks for env_name={env_name!r}.")
+
+    base_env = envs[env_name]
+    env = MetaworldTaskSwitcher(base_env, tasks)
+    if task_param is not None:
+        env.set_task(int(task_param) if isinstance(task_param, str) else task_param)
+    return env
+
+
+@_register("highway_parking")
+def _highway_parking_env(**kwargs) -> gym.Env:
+    try:
+        import highway_env  # noqa: F401
+    except ImportError:
+        raise ImportError("highway_env is required for highway_parking. Install with: pip install highway-env")
+    task = kwargs.pop("task", "park:0")
+    if isinstance(task, (list, tuple)):
+        task = task[0] if task else "park:0"
+    task = str(task)
+    dists_spec = kwargs.pop("dists_spec", None) or PARKING_DISTS_SPECS
+    tasks_spec = {tid: spec["config"] for tid, spec in PARKING_TASKS_SPECS.items()}
+    max_episode_steps = kwargs.pop("max_episode_steps", None)
+    kwargs.pop("_continual_task_list_len", None)  # internal; parking-v0 doesn't accept it
+    kwargs.pop("seed", None)  # ParkingEnv doesn't take seed in __init__; make_env seeds via reset()
+    kwargs.pop("render_mode", None)
+    env = gym.make("parking-v0", **kwargs)
+    env = HighwayParkingDistWrapper(
+        env,
+        dists_spec=dists_spec,
+        tasks_spec=tasks_spec,
+        initial_task=task,
+        max_episode_steps=max_episode_steps,
+    )
+    # parking-v0 uses KinematicsGoal (dict obs); vectorize for algo compatibility
+    env = VectorizeObsWrapper(env)
+    return env
+
+
+# Gymnasium MuJoCo Walker2d: same dynamics, task = reward config (forward_reward_weight, ctrl_cost_weight, healthy_reward)
+WALKER2D_REWARD_TASKS = {
+    "default": {"forward_reward_weight": 1.0, "ctrl_cost_weight": 1e-3, "healthy_reward": 1.0},
+    "forward_heavy": {"forward_reward_weight": 2.0, "ctrl_cost_weight": 1e-3, "healthy_reward": 0.5},
+    "low_ctrl": {"forward_reward_weight": 1.0, "ctrl_cost_weight": 1e-4, "healthy_reward": 1.0},
+    "survive": {"forward_reward_weight": 0.5, "ctrl_cost_weight": 1e-3, "healthy_reward": 2.0},
+}
+
+
+@_register("mujoco")
+def _mujoco_walker2d_env(**kwargs) -> gym.Env:
+    """Gymnasium MuJoCo Walker2d. env_id='mujoco/walker2d', task=reward config (default|forward_heavy|low_ctrl|survive)."""
+    env_id = kwargs.pop("env_id", "mujoco/walker2d")
+    task = kwargs.pop("task", "default")
+    if isinstance(task, (list, tuple)):
+        task = task[0] if task else "default"
+    task = str(task).lower()
+    if task not in WALKER2D_REWARD_TASKS:
+        raise ValueError(f"Unknown task {task!r}. Known: {list(WALKER2D_REWARD_TASKS.keys())}")
+    reward_kwargs = dict(WALKER2D_REWARD_TASKS[task])
+    kwargs.pop("max_episode_steps", None)
+    kwargs.pop("_continual_task_list_len", None)
+    kwargs.pop("seed", None)
+    env = gym.make("Walker2d-v4", **reward_kwargs, **kwargs)
+    return env
+
+
+# Gymnasium MuJoCo Humanoid: task = spec from HUMANOID_TASKS_SPECS (stand, walk_forward, run_forward, etc.)
+@_register("mujoco_humanoid")
+def _mujoco_humanoid_env(**kwargs) -> gym.Env:
+    """Gymnasium MuJoCo Humanoid with HumanoidTaskWrapper. env_id='mujoco/humanoid', task=name from crl.envs.tasks (e.g. stand, walk_forward, run_forward)."""
+    env_id = kwargs.pop("env_id", "mujoco/humanoid")
+    task = kwargs.pop("task", "stand")
+    if isinstance(task, (list, tuple)):
+        task = task[0] if task else "stand"
+    task = str(task)
+    if task not in HUMANOID_TASK_BY_NAME:
+        known = ", ".join(sorted(HUMANOID_TASK_BY_NAME.keys()))
+        raise ValueError(f"Unknown humanoid task {task!r}. Known: {known}")
+    task_spec = HUMANOID_TASK_BY_NAME[task]
+    env_kwargs = dict(task_spec.get("env_kwargs_override", {}))
+    kwargs.pop("max_episode_steps", None)
+    kwargs.pop("_continual_task_list_len", None)
+    kwargs.pop("seed", None)
+    env = gym.make("Humanoid-v5", **env_kwargs, **kwargs)
+    env = HumanoidTaskWrapper(env, task_spec)
     return env
 
 
@@ -95,64 +262,44 @@ def _continualworld_env(**kwargs) -> gym.Env:
 # Task sequence registrations
 # ============================================
 #
-# _register_task_sequence(ENV_NAME, SEQ_NAME, TASKS)
+# _register_task_sequence(ENV_NAME, LIST_NAME, TASKS)
 #
+
+# SimpleDistAsTaskEnv sequences
+_register_task_sequence("switchingdist", "basic", ["dist:0", "dist:1", "dist:2"])
+
+# Highway parking (parameterized reward distributions)
+_register_task_sequence("highway_parking", "dists_basic", ["park:0", "park:1", "park:2"])
+_register_task_sequence("highway_parking", "dists_full", ["park:0", "park:1", "park:2", "park:3", "park:4", "park:5", "park:6"])
+_register_task_sequence("highway_parking", "tasks_basic", ["task_1", "task_2", "task_3", "task_4", "task_5"])
+_register_task_sequence("highway_parking", "tasks_full", ["task_1", "task_2", "task_3", "task_4", "task_5", "task_6", "task_7", "task_8", "task_9", "task_10"])
 
 
 # GoalEnv sequences
-_register_task_sequence("goalenv", "cardinal", ["north", "south", "east", "west"])
-_register_task_sequence("goalenv", "horizontal", ["east", "west"])
-_register_task_sequence("goalenv", "vertical", ["north", "south"])
-_register_task_sequence("goalenv", "clockwise", ["north", "east", "south", "west"])
-_register_task_sequence("goalenv", "counter_clockwise", ["north", "west", "south", "east"])
+_register_task_sequence("minigrid", "basic", ["reachgreen", "reachblue", "pickupkey"])
 
-# DMControl sequences
-_register_task_sequence("dmcontrol", "walker_basic", ["walker/stand", "walker/walk"])
-_register_task_sequence("dmcontrol", "walker_full", ["walker/stand", "walker/walk", "walker/run"])
-_register_task_sequence("dmcontrol", "cartpole_basic", ["cartpole/swingup", "cartpole/balance"])
-_register_task_sequence("dmcontrol", "cartpole_full", [
-    "cartpole/swingup", "cartpole/balance", "cartpole/balance_sparse"
-])
+# DMControl sequences (new format: dmc/<domain> with simple task names)
+_register_task_sequence("dmc/walker", "basic", ["stand", "walk"])
+_register_task_sequence("dmc/walker", "full", ["stand", "walk", "run"])
+_register_task_sequence("dmc/cartpole", "basic", ["swingup", "balance"])
+_register_task_sequence("dmc/cartpole", "full", ["swingup", "balance", "balance_sparse"])
 
-# Continual World (MetaWorld) sequences
-# CW20: The standard 20-task sequence from Continual World benchmark
-_register_task_sequence("continualworld", "cw20", [
-    "hammer-v1",
-    "push-v1",
-    "door-open-v1",
-    "drawer-close-v1",
-    "drawer-open-v1",
-    "reach-v1",
-    "push-wall-v1",
-    "shelf-place-v1",
-    "button-press-v1",
-    "button-press-topdown-v1",
-    "button-press-topdown-wall-v1",
-    "peg-insert-side-v1",
-    "window-open-v1",
-    "window-close-v1",
-    "door-close-v1",
-    "reach-wall-v1",
-    "push-back-v1",
-    "lever-pull-v1",
-    "box-close-v1",
-    "hand-insert-v1",
-])
+# MiniHack sequences
+_register_task_sequence("minihack", "goals", [f"g_{i}_{j}" for i, j in itertools.product(range(10), range(10))])
 
-# CW10: A subset of 10 tasks from CW20
-_register_task_sequence("continualworld", "cw10", [
-    "hammer-v1",
-    "push-v1",
-    "door-open-v1",
-    "drawer-close-v1",
-    "drawer-open-v1",
-    "reach-v1",
-    "push-wall-v1",
-    "shelf-place-v1",
-    "button-press-v1",
-    "button-press-topdown-v1",
-])
+# metaworld sequences
+for env_name in ["reach-v3", "drawer-close-v3", "hammer-v3"]:
+    for task_num in [10, 20, 30, 40, 50]:
+        _register_task_sequence(f"metaworld/{env_name}", f"{task_num}", [str(i) for i in range(task_num)])
 
+# MuJoCo Walker2d: task = reward config (same dynamics, different reward weights)
+_register_task_sequence("mujoco/walker2d", "basic", ["default", "forward_heavy", "low_ctrl"])
+_register_task_sequence("mujoco/walker2d", "full", ["default", "forward_heavy", "low_ctrl", "survive"])
+
+# MuJoCo Humanoid: task = spec name from crl.envs.tasks (HUMANOID_TASKS_SPECS)
+_HUMANOID_TASK_NAMES = list(HUMANOID_TASK_BY_NAME.keys())
+_register_task_sequence("mujoco/humanoid", "basic", ["stand", "walk_forward", "run_forward", "crouch"])
+_register_task_sequence("mujoco/humanoid", "full", _HUMANOID_TASK_NAMES)
 
 # ============================================
 # Exposed public methods
@@ -168,21 +315,40 @@ def make_env(
 ) -> gym.Env:
     """
     Create a single environment by id with consistent seeding & optional wrappers.
-    - env_id: one of the keys in _REGISTRY (case-insensitive), e.g. "goalenv"
-    - seed: base seed; also used to seed action/obs spaces
-    - render_mode: forwarded to the underlying env if supported
-    - record_stats: attaches RecordEpisodeStatistics
-    - wrappers: list of callables env->env to apply after creation
-    - env_kwargs: forwarded to the underlying constructor
+
+    - env_id: registry key (case-insensitive), e.g. "minigrid", "switchingdist",
+      "dmc/walker", "metaworld/reach-v3". For dmc use "dmc/<domain>" and pass task=...
+    - seed, render_mode, record_stats, wrappers: applied consistently.
+    - env_kwargs: passed through to the backend constructor (task, max_episode_steps,
+      etc.). No global injection of domain_name; each backend receives only what it needs.
     """
     key = env_id.lower()
+    # Only set kwargs that are common or backend-specific; do not inject domain_name for all.
+    env_kwargs.setdefault("seed", seed)
+    env_kwargs.setdefault("render_mode", render_mode)
+
+    if key.startswith("metaworld/"):
+        env_kwargs["env_id"] = env_id  # so _metaworld_env can parse "metaworld/reach-v3"
+        key = "metaworld"
+
+    if key.startswith("dmc/"):
+        domain = key.split("/", 1)[1]
+        if "dmcontrol" not in _REGISTRY:
+            known = ", ".join(sorted(_REGISTRY.keys()))
+            raise ValueError(f"DMControl not available. Known envs: {known}")
+        env_kwargs["domain"] = domain
+        key = "dmcontrol"
+
+    if key == "mujoco/humanoid":
+        env_kwargs["env_id"] = env_id
+        key = "mujoco_humanoid"
+    elif key.startswith("mujoco/"):
+        env_kwargs["env_id"] = env_id
+        key = "mujoco"
+
     if key not in _REGISTRY:
         known = ", ".join(sorted(_REGISTRY.keys()))
         raise ValueError(f"Unknown env_id '{env_id}'. Known: {known}")
-
-    # Forward render_mode if constructor accepts it
-    if "render_mode" not in env_kwargs:
-        env_kwargs["render_mode"] = render_mode
 
     env = _REGISTRY[key](**env_kwargs)
 
@@ -197,8 +363,8 @@ def make_env(
             pass
 
     # Optional per-project standard wrapper
-    if record_stats:
-        env = RecordEpisodeStatistics(env)
+    # if record_stats:
+    #     env = RecordEpisodeStatistics(env)  # Commented out - not needed
 
     # User-specified wrapper chain
     if wrappers:
@@ -270,8 +436,8 @@ def make_vec_env(
 
 def make_continual_episodic_env(
     env_id: str,
-    task_list: list[str],
-    episode_length: int = 100,
+    task_list: str | list[str],
+    max_episode_steps: int = 100,
     task_switch_prob: float = 1.0,
     seed: Optional[int] = None,
     render_mode: Optional[str] = None,
@@ -280,155 +446,87 @@ def make_continual_episodic_env(
     **env_kwargs: Any,
 ) -> gym.Env:
     """
-    Create a continual episodic environment where:
-    - Each episode lasts for exactly N timesteps (episode_length)
-    - A task is selected at the start of each episode with a given probability
-    - Tasks can persist across multiple episodes, allowing the agent to face
-      the same task for consecutive episodes
+    Create a continual episodic environment: one env from make_env, wrapped with
+    ContinualEpisodicWrapper. The underlying env should expose set_task(task) or
+    .task so the wrapper can switch tasks on reset; if not, a per-task env_factory
+    is used (e.g. for MiniHack).
 
-    Args:
-        env_id: Environment identifier (e.g., "goalenv", "continualworld")
-        task_list: List of task identifiers to randomly sample from
-        episode_length: Fixed number of timesteps per episode (N)
-        task_switch_prob: Probability of switching to a new task at each episode reset.
-                         Default 1.0 means task changes every episode.
-                         Lower values (e.g., 0.1) allow tasks to persist across episodes.
-        seed: Random seed for task selection and environment
-        render_mode: Forwarded to underlying environment
-        record_stats: Attaches RecordEpisodeStatistics wrapper
-        wrappers: Additional wrappers to apply before ContinualEpisodicWrapper
-        env_kwargs: Additional arguments forwarded to make_env
+    - Each episode lasts for exactly N timesteps (max_episode_steps).
+    - A task is selected at the start of each episode with task_switch_prob.
+    - task_list: list of task ids, or a string sequence name to look up.
 
-    Returns:
-        Wrapped environment with continual episodic behavior
-
-    Example:
-        env = make_continual_episodic_env(
-            "goalenv",
-            task_list=["north", "south", "east", "west"],
-            episode_length=200,
-            task_switch_prob=0.1,  # 10% chance to switch task each episode
-            seed=42
-        )
+    env_kwargs are forwarded to make_env (e.g. max_episode_steps, _continual_task_list_len
+    for metaworld). No task_list is passed into make_env.
     """
 
-    # Create initial environment (will be replaced on first reset)
-    initial_task = task_list[0]
-    base_env = make_env(
+    # Resolve task_list if it's a string (task sequence name)
+    if isinstance(task_list, str):
+        task_list = get_task_sequence(env_id, task_list)
+
+    # Kwargs for the single env: only what make_env needs (no task_list).
+    # _continual_task_list_len is used by metaworld to build the right number of tasks.
+    base_kwargs = {
+        **env_kwargs,
+        "max_episode_steps": max_episode_steps,
+        "_continual_task_list_len": len(task_list),
+    }
+
+    # Single env with initial task.
+    env = make_env(
         env_id,
-        task=initial_task,
-        seed=None,  # Don't seed here, will be seeded in wrapper
+        task=task_list[0],
+        seed=seed,
         render_mode=render_mode,
-        record_stats=False,  # Apply after continual wrapper
+        record_stats=False,
         wrappers=wrappers,
-        **env_kwargs
+        **base_kwargs,
     )
 
-    # Create factory function for creating new environments with different tasks
-    def env_factory(task: str) -> gym.Env:
-        return make_env(
-            env_id,
-            task=task,
-            seed=None,
-            render_mode=render_mode,
-            record_stats=False,
-            wrappers=wrappers,
-            **env_kwargs
-        )
+    # Use env_factory only when env cannot switch task in-place (no set_task / .task).
+    base = env.unwrapped if hasattr(env, "unwrapped") else env
+    has_set_task = callable(getattr(env, "set_task", None)) or callable(getattr(base, "set_task", None))
+    has_task_attr = hasattr(env, "task") or hasattr(base, "task")
+    if has_set_task or has_task_attr:
+        env_factory = None
+    else:
+        def env_factory(task: str) -> gym.Env:
+            return make_env(
+                env_id, task=task, seed=seed, render_mode=render_mode,
+                record_stats=False, wrappers=wrappers, **base_kwargs,
+            )
 
     # Wrap with ContinualEpisodicWrapper
     env = ContinualEpisodicWrapper(
-        env=base_env,
+        env=env,
         task_list=task_list,
-        episode_length=episode_length,
+        max_episode_steps=max_episode_steps,
         env_factory=env_factory,
         task_switch_prob=task_switch_prob,
-        seed=seed
+        seed=seed,
     )
 
-    # Apply record_stats wrapper if requested
-    if record_stats:
-        env = RecordEpisodeStatistics(env)
+    # if record_stats:
+    #     env = RecordEpisodeStatistics(env)
 
     return env
 
 
 if __name__ == "__main__":
-
-    print("Available envs:")
-
-    all_sequences = list_task_sequences()
-    for env_name, sequences in all_sequences.items():
-        print(f"   {env_name}:")
-        for seq_name, tasks in sequences.items():
-            print(f"     - {seq_name}: {tasks}")
-
-    # List available environments
+    print("=" * 60)
+    print("Environments")
+    print("=" * 60)
     envs = list_envs()
-    print(f"Available environments: {envs}")
+    for env_id in envs:
+        print(f"  {env_id}")
 
-    # Get cardinal sequence for goalenv
-    cardinal_tasks = get_task_sequence("goalenv", "cardinal")
-    print(f"goalenv cardinal: {cardinal_tasks}")
-
-    # Get DMControl sequences
-    walker_tasks = get_task_sequence("dmcontrol", "walker_basic")
-    print(f"dmcontrol walker_basic: {walker_tasks}")
-
-    # Test dm_control environment
-    print("\n" + "="*50)
-    print("Testing DMControl environment...")
-    print("="*50)
-    try:
-        # Test with cartpole (simple, fast)
-        print("\nTesting cartpole/swingup...")
-        env = make_env("dmcontrol", task="cartpole/swingup", seed=42)
-        print(f"  Observation space: {env.observation_space}")
-        print(f"  Action space: {env.action_space}")
-
-        obs, info = env.reset()
-        print(f"  Initial observation shape: {obs.shape}")
-        print(f"  Initial observation range: [{obs.min():.3f}, {obs.max():.3f}]")
-
-        # Run a few steps
-        total_reward = 0.0
-        for step in range(5):
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            print(f"  Step {step+1}: reward={reward:.3f}, "
-                  f"terminated={terminated}, truncated={truncated}")
-            if terminated or truncated:
-                obs, info = env.reset()
-                print(f"    Reset: new obs shape={obs.shape}")
-
-        print(f"  Total reward over 5 steps: {total_reward:.3f}")
-        env.close()
-        print("  ✓ cartpole/swingup test passed!")
-
-        # Test with walker (more complex)
-        print("\nTesting walker/walk...")
-        env = make_env("dmcontrol", task="walker/walk", seed=42)
-        print(f"  Observation space: {env.observation_space}")
-        print(f"  Action space: {env.action_space}")
-
-        obs, info = env.reset()
-        print(f"  Initial observation shape: {obs.shape}")
-
-        # Run a few steps
-        for step in range(3):
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
-            print(f"  Step {step+1}: reward={reward:.3f}, obs_shape={obs.shape}")
-
-        env.close()
-        print("  ✓ walker/walk test passed!")
-
-        print("\n" + "="*50)
-        print("All DMControl tests passed! ✓")
-        print("="*50)
-
-    except Exception as e:
-        print(f"\n✗ DMControl test failed with error: {e}")
-        import traceback
-        traceback.print_exc()
+    print("\n" + "=" * 60)
+    print("Task sequences (env -> sequence_name -> task list)")
+    print("=" * 60)
+    all_sequences = list_task_sequences()
+    for env_name in sorted(all_sequences.keys()):
+        print(f"\n  {env_name}:")
+        for seq_name, tasks in sorted(all_sequences[env_name].items()):
+            n = len(tasks)
+            preview = tasks[:5] if n > 5 else tasks
+            suffix = f" ... ({n} total)" if n > 5 else f" ({n} tasks)"
+            print(f"    {seq_name}: {preview}{suffix}")

@@ -14,6 +14,7 @@ import tyro
 import torch
 import wandb
 import random
+import dataclasses
 import numpy as np
 import gymnasium as gym
 from collections import deque
@@ -21,37 +22,37 @@ from collections import deque
 from torch import nn
 from torch.optim import Adam
 from dataclasses import dataclass, asdict
+from tqdm import tqdm
 
 from crl.buffers import ReplayBuffer
-from crl.envs import make_env, get_task_sequence
+from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence
 
 
 # ==============================
 # Parameters
 # ==============================
-@dataclass
-class Args:
-    results_dir: str = "results"
-    """Directory to save results"""
-    model_dir: str = "models"
-    """Directory to save models"""
 
-    algo_name: str = os.path.basename(__file__).split('.')[0]
-    """Name of the algorithm"""
-    env_name: str = "goalenv"
-    """Name of the environment"""
-    task_sequence: str = 'cardinal'
-    """Name of the task, or sequence of tasks for continual"""
-    rb_size: int = 10**6
-    """Replay buffer size"""
+@dataclass
+class Config:
+
+    s_dim: int = -1
+    a_dim: int = -1
+
     seed: int = 0
-    """Random seed"""
-    load: bool = False
-    """Whether to load model from path or train from scratch"""
-    log_freq: int = 1000
-    """Log loss info every log_freq train steps."""
-    eval_freq: int = 1000
-    """Evaluate on task every eval_freq train steps."""
+    env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
+
+    # Training parameters
+    num_episodes: int = 10**4  # training episodes
+    buffer_size: int = 100_000
+
+    # Dual-timescale specific parameters
+    adaptation_threshold: float = 0.1     # Change detection (lowered for sensitivity)
+    prediction_window: int = 50   # Window for computing prediction error variance (smaller for faster detection)
+    min_transient_weight: float = 0.05
+    max_transient_weight: float = 0.95
+    epsilon_restore_threshold: float = 0.2  # Lower threshold for epsilon restoration
+
+    device: str = "cuda"
 
     # Dual-timescale learning rates
     lr_permanent: float = 2e-4  # Slower learning for permanent component
@@ -61,29 +62,23 @@ class Args:
     epsilon_min: float = 0.2
     epsilon_decay: float = 0.999
 
-    buffer_size: int = 100_000
     target_update_freq: int = 1000
     tau: float = 1.0  # Hard update coefficient for target network
     batch_size: int = 128
-    train_steps_per_task: int = 8_000
-    start_steps_per_task: int = 2000
-    eval_episodes: int = 5  # Number of episodes for evaluation
+    train_freq: int = 1  # Train every N episodes
+    warmup_episodes: int = 10  # Episodes before training starts
 
-    # Dual-timescale specific parameters
-    adaptation_threshold: float = 0.1     # Change detection (lowered for sensitivity)
-    prediction_window: int = 50   # Window for computing prediction error variance (smaller for faster detection)
-    min_transient_weight: float = 0.05
-    max_transient_weight: float = 0.95
-    epsilon_restore_threshold: float = 0.2  # Lower threshold for epsilon restoration
+    # Evaluation
+    eval_freq: int = 100  # episodes
+    do_eval: bool = True
+    num_eval_episodes: int = 5
 
-    device: str = "mps"
-    weight_init_noise: float = 0.1
+    # wandb
+    use_wandb: bool = True
+    algo_name: str = "PTDQN"
+    proj_name: str = "continual-rl"
 
-    def __post_init__(self):
-        """Set up task_list from task_sequence after initialization."""
-        self.task_list = get_task_sequence(self.env_name, self.task_sequence)
-        self.model_path = f"{self.model_dir}/{self.env_name}/{self.task_sequence}/{self.algo_name}/{self.seed}.pt"
-        self.results_path = f"{self.results_dir}/{self.env_name}/{self.task_sequence}/{self.algo_name}/{self.seed}"
+
 
 
 # ==============================
@@ -91,32 +86,20 @@ class Args:
 # ==============================
 
 class DualTimescaleQNetwork(nn.Module):
-    """Q-Network with separate permanent and transient components"""
+    """Q-Network with separate permanent and transient components (MLP for flat vector states)"""
 
-    def __init__(self, env):
+    def __init__(self, s_dim, a_dim):
         super().__init__()
-        # Architecture for image inputs with shape (H, W, C)
-        s_dim = env.observation_space.shape
-        a_dim = env.action_space.n
-        height, width, channels = s_dim
-
-        # Store normalization bounds for general Box environments
-        self.obs_low = torch.FloatTensor(env.observation_space.low)
-        self.obs_high = torch.FloatTensor(env.observation_space.high)
-
-        # Shared convolutional layers
-        self.shared_conv = nn.Sequential(
-            nn.Conv2d(channels, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
+        # Architecture for flat vector inputs
+        # s_dim can be a tuple like (147,) or an int
+        if isinstance(s_dim, tuple):
+            obs_dim = s_dim[0] if len(s_dim) == 1 else int(np.prod(s_dim))
+        else:
+            obs_dim = s_dim
 
         # Shared fully connected layers
-        conv_out_size = 32 * height * width
         self.shared_fc = nn.Sequential(
-            nn.Linear(conv_out_size, 256),
+            nn.Linear(obs_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU()
@@ -139,13 +122,9 @@ class DualTimescaleQNetwork(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Conv & hidden Linear: Kaiming for ReLU, bias=0
+        # Hidden Linear: Kaiming for ReLU, bias=0
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, nn.Linear):
+            if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
@@ -157,26 +136,14 @@ class DualTimescaleQNetwork(nn.Module):
             nn.init.constant_(output_layer.bias, 0.0)
 
     def forward(self, x, return_components=False):
-        # Handle input shape: expect (batch, H, W, C) or (H, W, C)
-        # Convert to PyTorch conv format: (batch, C, H, W)
+        if len(x.shape) == 1:
+            x = x.unsqueeze(0)
 
-        # Add batch dimension if needed
-        if len(x.shape) == 3:  # (H, W, C)
-            x = x.unsqueeze(0)  # (1, H, W, C)
+        if len(x.shape) > 2:
+            x = x.reshape(x.shape[0], -1)
 
-        # Permute to PyTorch conv format: (batch, H, W, C) -> (batch, C, H, W)
-        x = x.permute(0, 3, 1, 2)
-
-        # Simple normalization for MiniAtar (already in [0,1] range)
-        if x.min() < 0 or x.max() > 1:
-            # Normalize to [0,1] if not already
-            x = (x - x.min()) / (x.max() - x.min() + 1e-8)
-
-        # Shared feature extraction
-        x = self.shared_conv(x)
         features = self.shared_fc(x)
 
-        # Compute permanent and transient Q-values
         q_permanent = self.permanent_head(features)
         q_transient = self.transient_head(features)
 
@@ -193,21 +160,16 @@ class DualTimescaleQNetwork(nn.Module):
 class PTDQN():
     """Dual-Timescale Deep Q-Network agent for continual learning without task boundaries"""
 
-    def __init__(self, env: gym.Env, config: Args):
-        self.env = env
+    def __init__(self, config: Config):
         self.config = config
-        self.device = torch.device(config.device)
-
-        self.s_dim = env.observation_space.shape
-        self.a_dim = env.action_space.n
+        self.device = torch.device(config.device if torch.cuda.is_available() or config.device == "cpu" or config.device == "mps" else "cpu")
 
         # Networks
-        self.q_network = DualTimescaleQNetwork(env).to(self.device)
-        self.target_network = DualTimescaleQNetwork(env).to(self.device)
+        self.q_network = DualTimescaleQNetwork(config.s_dim, config.a_dim).to(self.device)
+        self.target_network = DualTimescaleQNetwork(config.s_dim, config.a_dim).to(self.device)
 
         # Separate optimizers for different learning rates
-        permanent_params = (list(self.q_network.shared_conv.parameters()) +
-                            list(self.q_network.shared_fc.parameters()) +
+        permanent_params = (list(self.q_network.shared_fc.parameters()) +
                             list(self.q_network.permanent_head.parameters()))
         transient_params = list(self.q_network.transient_head.parameters())
 
@@ -216,14 +178,6 @@ class PTDQN():
 
         self.target_network.load_state_dict(self.q_network.state_dict())
 
-        self.replay_buffer = ReplayBuffer(
-            buffer_size=self.config.buffer_size,
-            observation_space=self.env.observation_space,
-            action_space=self.env.action_space,
-            device=self.device
-        )
-
-        # TODO: adjust epsilon every change detection, otherwise it will shrink
         # Training state
         self.epsilon = config.epsilon
         self.global_step = 0
@@ -232,14 +186,6 @@ class PTDQN():
         self.prediction_errors = deque(maxlen=config.prediction_window)
         self.transient_weight = 0.5  # Initial weight for transient component
         self.change_signal = 0.0
-
-        # Data collection - single metrics dict
-        self.metrics = {
-            'training': [],   # Training losses and diagnostics
-            'eval': [],       # Periodic evaluations during training (learning curves)
-            'continual': [],  # Task completion evaluations (for FT, BT, forgetting)
-            'config': asdict(self.config)
-        }
 
     def _update_change_detection(self, td_error: float):
         """Update change detection based on prediction error variance"""
@@ -258,15 +204,12 @@ class PTDQN():
         else:
             cv = 0.0
 
-        # Convert to change signal
         raw_signal = min(cv / self.config.adaptation_threshold, 1.0)
 
-        # Smooth the signal
         prev_change_signal = self.change_signal
         self.change_signal = 0.9 * self.change_signal + 0.1 * raw_signal
 
-        # Debug: Print change detection info periodically
-        if len(self.prediction_errors) % 20 == 0:  # Every 20 updates
+        if len(self.prediction_errors) % 20 == 0:
             print(f"[Debug] Change detection: signal={self.change_signal:.3f}, epsilon={self.epsilon:.3f}, td_error={td_error:.3f}")
 
         # Restore epsilon when significant change is detected
@@ -283,44 +226,36 @@ class PTDQN():
     def act(self, state, training: bool = False):
         """Select action using epsilon-greedy policy on combined Q-values"""
         if training and random.random() < self.epsilon:
-            return random.randrange(self.a_dim)
+            return random.randrange(self.config.a_dim)
 
         with torch.no_grad():
-            # Convert state to tensor
             if isinstance(state, np.ndarray):
                 state_tensor = torch.FloatTensor(state).to(self.device)
             else:
                 state_tensor = state.to(self.device)
 
-            # Get Q-values from both components
             q_permanent, q_transient = self.q_network(state_tensor, return_components=True)
 
-            # Combine Q-values using adaptive weighting
             q_combined = ((1 - self.transient_weight) * q_permanent +
                           self.transient_weight * q_transient)
 
             return q_combined.argmax().item()
 
-    def train_step(self):
+    def update(self, replay_buffer):
         """Perform one training step with dual timescales"""
-        if len(self.replay_buffer) < self.config.batch_size:
+        if len(replay_buffer) < self.config.batch_size:
             return
 
-        # Sample batch
-        states, next_states, actions, rewards, dones = self.replay_buffer.sample(self.config.batch_size)
+        states, next_states, actions, rewards, dones = replay_buffer.sample(self.config.batch_size)
 
-        # Get current Q-values from both components
         q_permanent, q_transient = self.q_network(states, return_components=True)
 
-        # Select Q-values for taken actions
         q_permanent_selected = q_permanent.gather(1, actions.unsqueeze(1))
         q_transient_selected = q_transient.gather(1, actions.unsqueeze(1))
 
-        # Compute target Q-values
         with torch.no_grad():
             next_q_permanent, next_q_transient = self.target_network(next_states, return_components=True)
 
-            # For target, use current transient weight
             next_q_combined = ((1 - self.transient_weight) * next_q_permanent +
                                self.transient_weight * next_q_transient)
 
@@ -328,40 +263,48 @@ class PTDQN():
             target_q_values = (rewards.unsqueeze(1) +
                                (self.config.gamma * next_q_max * ~dones.unsqueeze(1)))
 
-        # Compute losses for both components
         criterion = nn.SmoothL1Loss()
         permanent_loss = criterion(q_permanent_selected, target_q_values)
         transient_loss = criterion(q_transient_selected, target_q_values)
 
-        # Update change detector
         combined_q = ((1 - self.transient_weight) * q_permanent_selected +
                       self.transient_weight * q_transient_selected)
         td_error = (target_q_values - combined_q).mean().item()
         self._update_change_detection(td_error)
 
-        # Backpropagation with different learning rates
-        # Clear gradients for both optimizers
+
         self.permanent_optimizer.zero_grad()
         self.transient_optimizer.zero_grad()
 
-        # Compute total loss and backpropagate once
         total_loss = permanent_loss + transient_loss
         total_loss.backward()
 
-        # Clip gradients
         torch.nn.utils.clip_grad_value_(
-            list(self.q_network.shared_conv.parameters()) +
             list(self.q_network.shared_fc.parameters()) +
             list(self.q_network.permanent_head.parameters()), 100)
         torch.nn.utils.clip_grad_value_(
             list(self.q_network.transient_head.parameters()), 100)
 
-        # Update both optimizers
         self.permanent_optimizer.step()
         self.transient_optimizer.step()
 
+        if self.global_step % self.config.target_update_freq == 0:
+            for t_param, q_param in zip(self.target_network.parameters(),
+                                        self.q_network.parameters()):
+                t_param.data.copy_(
+                    self.config.tau * q_param.data +
+                    (1.0 - self.config.tau) * t_param.data
+                )
+
+        # Decay epsilon
+        if self.epsilon > self.config.epsilon_min:
+            self.epsilon *= self.config.epsilon_decay
+
+        # Increment global step
+        self.global_step += 1
+
         # Return diagnostic information
-        diagnostics = {
+        metrics = {
             'permanent_loss': permanent_loss.item(),
             'transient_loss': transient_loss.item(),
             'combined_loss': criterion(combined_q, target_q_values).item(),
@@ -377,155 +320,7 @@ class PTDQN():
             'reward_min': rewards.min().item()
         }
 
-        return diagnostics
-
-    def train(self):
-        """Main training loop with task-based structure"""
-        step = 0  # Global step
-
-        for task_idx, task_id in enumerate(self.config.task_list):
-            task_env = make_env(self.config.env_name, task=task_id)
-            state, _ = task_env.reset()
-
-            for task_step in range(self.config.train_steps_per_task):
-                # Select action
-                action = self.act(state, training=True)
-
-                next_state, reward, terminated, truncated, _ = task_env.step(action)
-                self.replay_buffer.add(state, next_state, action, reward, terminated, truncated)
-                state = next_state
-
-                # Reset if episode ended
-                if terminated or truncated:
-                    state, _ = task_env.reset()
-
-                # Train after initial steps
-                if task_step >= self.config.start_steps_per_task:
-                    diagnostics = self.train_step()
-
-                    if diagnostics is not None:
-                        wandb.log({
-                            "train/permanent_loss": diagnostics['permanent_loss'],
-                            "train/transient_loss": diagnostics['transient_loss'],
-                            "train/combined_loss": diagnostics['combined_loss'],
-                            "train/td_error": diagnostics['td_error'],
-                            "train/change_signal": diagnostics['change_signal'],
-                            "train/transient_weight": diagnostics['transient_weight'],
-                            "train/q_permanent_mean": diagnostics['q_permanent_mean'],
-                            "train/q_transient_mean": diagnostics['q_transient_mean'],
-                            "train/q_combined_mean": diagnostics['q_combined_mean'],
-                            "train/target_mean": diagnostics['target_mean'],
-                            "train/reward_mean": diagnostics['reward_mean'],
-                            "train/reward_max": diagnostics['reward_max'],
-                            "train/reward_min": diagnostics['reward_min'],
-                            "train/epsilon": self.epsilon,
-                            "train/buffer_size": len(self.replay_buffer),
-                        }, step=step)
-
-                        # Save training metrics
-                        self.metrics['training'].append({
-                            'step': step,
-                            'task': task_id,
-                            'task_index': task_idx,
-                            **diagnostics,
-                            'epsilon': self.epsilon,
-                            'change_signal': self.change_signal,
-                            'transient_weight': self.transient_weight,
-                            'buffer_size': len(self.replay_buffer)
-                        })
-
-                    # Evaluate periodically for monitoring
-                    if step % self.config.eval_freq == 0:
-                        avg_reward, avg_std = self.evaluate(task_id)
-
-                        wandb.log({
-                            "eval/avg_reward": avg_reward,
-                            "eval/reward_std": avg_std,
-                        }, step=step)
-
-                        # Save periodic evaluation on CURRENT task (for learning curves)
-                        self.metrics['eval'].append({
-                            'step': step,
-                            'task_learned': task_id,
-                            'task_evaluated': task_id,  # Same task
-                            'reward_mean': avg_reward,
-                            'reward_std': avg_std
-                        })
-
-                        loss_val = diagnostics['combined_loss'] if diagnostics else 0.0
-                        print("-"*50)
-                        print(f"[Step] {task_step}/{self.config.train_steps_per_task} "
-                              f"[Task] {task_idx}/{len(self.config.task_list)}, "
-                              f"Loss {loss_val:.3f} Reward {avg_reward:.3f} ± {avg_std:.3f} "
-                              f"Epsilon: {self.epsilon:.3f}")
-                        if diagnostics:
-                            print(f"Change Signal: {diagnostics['change_signal']:.3f}, "
-                                  f"Transient Weight: {diagnostics['transient_weight']:.3f}")
-                            print(f"P-Loss: {diagnostics['permanent_loss']:.3f}, "
-                                  f"T-Loss: {diagnostics['transient_loss']:.3f}")
-
-                    # Target network update
-                    if step % self.config.target_update_freq == 0:
-                        for t_param, q_param in zip(self.target_network.parameters(),
-                                                    self.q_network.parameters()):
-                            t_param.data.copy_(
-                                self.config.tau * q_param.data +
-                                (1.0 - self.config.tau) * t_param.data
-                            )
-
-                    # Decay epsilon
-                    if self.epsilon > self.config.epsilon_min:
-                        self.epsilon *= self.config.epsilon_decay
-
-                    step += 1
-
-            # Evaluation for continual metrics
-            print(f"\nCompleted task {task_idx}/{len(self.config.task_list) - 1}: {task_id} evaluating on all tasks...")
-            for eval_task_id in self.config.task_list:
-                avg_reward, std_reward = self.evaluate(eval_task_id)
-
-                self.metrics['continual'].append({
-                    'step': step,
-                    'task_learned': task_id,
-                    'task_evaluated': eval_task_id,  # Different tasks
-                    'reward_mean': avg_reward,
-                    'reward_std': std_reward
-                })
-                wandb.summary[f"eval/{eval_task_id}_after_{task_id}"] = avg_reward
-
-        os.makedirs(self.config.results_path, exist_ok=True)
-        with open(f"{self.config.results_path}/data.json", 'w') as f:
-            json.dump(self.metrics, f, indent=2, default=str)
-
-    def evaluate(self, task_id):
-        """Evaluate the agent"""
-        total_rewards = []
-        eval_env = make_env(self.config.env_name, task=task_id)
-
-        try:
-            for episode in range(self.config.eval_episodes):
-                state, _ = eval_env.reset()
-                episode_reward = 0
-
-                while True:
-                    action = self.act(state, training=False)
-                    next_obs, reward, terminated, truncated, _ = eval_env.step(action)
-                    state = next_obs
-                    episode_reward += reward
-
-                    if terminated or truncated:
-                        break
-
-                total_rewards.append(episode_reward)
-
-            avg_reward = np.mean(total_rewards)
-            std_reward = np.std(total_rewards)
-            print(f"[Eval] task {task_id}: {avg_reward:.2f} ± {std_reward:.2f} on {self.config.eval_episodes}")
-
-            return avg_reward, std_reward
-        finally:
-            # Always clean up the environment
-            eval_env.close()
+        return metrics
 
     def save(self, path):
         """Save the model"""
@@ -560,20 +355,161 @@ class PTDQN():
         self.metrics = ckpt.get("metrics", {'training': [], 'eval': [], 'continual': [], 'config': asdict(self.config)})
 
 
+def evaluate_all_tasks(agent, config, t):
+
+    task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
+
+    if config.use_wandb:
+        # One table for all tasks at this eval step (preferred)
+        returns_table = wandb.Table(columns=["eval_step", "task", "episode", "return"])
+
+    for task in task_list:
+        eval_env = make_env(env_id=config.env.domain_name, task=task)
+
+        total_reward = np.zeros((config.num_eval_episodes,), dtype=np.float32)
+        for ep in range(config.num_eval_episodes):
+            obs, _ = eval_env.reset()
+
+            terminated = truncated = False
+            while not (terminated or truncated):
+
+                obs_tensor = torch.as_tensor(obs, device=agent.device, dtype=torch.float32)
+                action = agent.act(obs_tensor, training=False)
+
+                next_obs, reward, terminated, truncated, info = eval_env.step(action)
+                next_obs = np.asarray(next_obs, dtype=np.float32)
+                total_reward[ep] += reward
+                obs = next_obs
+
+            if config.use_wandb:
+                returns_table.add_data(int(t), str(task), int(ep), float(total_reward[ep]))
+
+        # Compute statistics after all episodes for this task
+        mean_r = float(np.mean(total_reward))
+        std_r = float(np.std(total_reward))
+
+        if config.use_wandb:
+            wandb.log({
+                f"eval/{task}/reward_mean": mean_r,
+                f"eval/{task}/reward_std": std_r,
+            }, step=t)
+
+        eval_env.close()
+
+    if config.use_wandb:
+        # Log the per-episode returns table once per eval step
+        wandb.log({
+            "eval/returns_table": returns_table,
+        }, step=t)
+
+
+
 if __name__ == "__main__":
-    args = tyro.cli(Args)
 
-    wandb.init(
-        project="crl",
-        group=f"{args.algo_name}",
-        name=f"{args.env_name}_{args.task_sequence}_{args.algo_name}_{args.seed}",
-        config=asdict(args)
-    )
-    env = make_env(args.env_name)
+    config = tyro.cli(Config)
 
-    agent = PTDQN(env, args)
-    if args.load:
-        agent.load(args.model_path)
+    if config.use_wandb:
+        wandb.init(
+            project=config.proj_name,
+            group=f"{config.env.domain_name}-{config.env.task_list}-s{config.env.seed}",
+            name=f"{config.algo_name}-s{config.seed}",
+            config=asdict(config)
+        )
+
+    if isinstance(config.env.task_list, str):
+        task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
     else:
-        agent.train()
-        agent.save(args.model_path)
+        task_list = config.env.task_list
+
+    print(f"Task list: {task_list}")
+
+    env = make_continual_episodic_env(
+        env_id=config.env.domain_name,
+        task_list=task_list,
+        max_episode_steps=config.env.max_episode_steps,
+        task_switch_prob=config.env.task_switch_prob,
+        seed=config.env.seed,
+    )
+
+    assert isinstance(env.action_space, gym.spaces.Discrete) or hasattr(env.action_space, 'n'), print("Actions must be discrete")
+
+    s_dim = env.observation_space.shape
+    a_dim = env.action_space.n
+
+    config.s_dim = s_dim
+    config.a_dim = a_dim
+
+    agent = PTDQN(config)
+
+    replay_buffer = ReplayBuffer(
+        buffer_size=config.buffer_size,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=config.device
+    )
+
+    cumulative_reward = 0
+    episode_rewards = []
+
+    if isinstance(config.env.task_list, str):
+        task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
+    else:
+        task_list = config.env.task_list
+    task_to_id = {task: idx for idx, task in enumerate(task_list)}
+
+    for episode in tqdm(range(config.num_episodes)):
+        # --------------------------------------------------
+        # Evaluation
+        # --------------------------------------------------
+        if episode % config.eval_freq == 0 and episode > 0:
+            print(f"\n[Episode {episode}] Running evaluation on all tasks...")
+            evaluate_all_tasks(agent, config, episode)
+
+        # --------------------------------------------------
+        # Train the agent
+        # --------------------------------------------------
+        if episode % config.train_freq == 0 and len(replay_buffer) >= config.batch_size and episode >= config.warmup_episodes:
+            metrics = agent.update(replay_buffer)
+
+            if metrics is not None and config.use_wandb:
+                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=episode)
+
+        # --------------------------------------------------
+        # Online env interaction
+        # --------------------------------------------------
+        state, info = env.reset()
+        # Extract current task for logging
+        current_task = info.get('task', 'unknown') if info else 'unknown'
+        current_task_id = task_to_id.get(current_task, -1)
+
+        terminated = truncated = False
+        episode_reward = 0.0
+        episode_steps = 0
+
+        while not (terminated or truncated):
+            # Select action
+            action = agent.act(state, training=True)
+
+            next_state, reward, terminated, truncated, info = env.step(action)
+            replay_buffer.add(state, next_state, action, reward, terminated, truncated)
+
+            episode_reward += reward
+            episode_steps += 1
+            state = next_state
+
+        cumulative_reward += episode_reward
+        episode_rewards.append(episode_reward)
+
+        # --------------------------------------------------
+        # Online metrics
+        # --------------------------------------------------
+        if config.use_wandb:
+            wandb.log({
+                "metrics/cumulative_reward": cumulative_reward,
+                "metrics/log_cumulative_reward": np.log(cumulative_reward),
+                "metrics/reward_per_episode": episode_reward,
+                "metrics/task_id": current_task_id,
+            }, step=episode)
+
+
+

@@ -51,19 +51,19 @@ class Args:
     eval_freq: int = 1000
     """Evaluate on task every eval_freq train steps."""
 
-    lr: float = 5e-4  # Increased learning rate for faster adaptation
-    gamma: float = 0.99  # Reduced gamma for better stability with sparse rewards
+    lr: float = 5e-4
+    gamma: float = 0.99
     epsilon: float = 1.0
-    epsilon_min: float = 0.1  # Higher min epsilon for more exploration
-    epsilon_decay: float = 0.9995  # Much slower decay to maintain exploration
+    epsilon_min: float = 0.1
+    epsilon_decay: float = 0.9995
 
-    buffer_size: int = 50_000  # Reduced buffer size
-    target_update_freq: int = 500   # Less frequent target updates for stability
-    tau: float = 1.0  # Soft update coefficient for target network
-    batch_size: int = 64       # Larger batch size for more stable updates
-    train_steps_per_task: int = 4_000  # Train steps per task
-    start_steps_per_task: int = 1000    # Warmup steps per task
-    eval_episodes: int = 5  # Number of episodes for evaluation
+    buffer_size: int = 50_000
+    target_update_freq: int = 500
+    tau: float = 1.0
+    batch_size: int = 64
+    train_steps_per_task: int = 4_000
+    start_steps_per_task: int = 1000
+    eval_episodes: int = 5
 
     device: str = "mps"
     weight_init_noise: float = 0.1
@@ -89,7 +89,6 @@ class QNetwork(nn.Module):
         a_dim = env.action_space.n
         height, width, channels = s_dim
 
-        # Store normalization bounds for general Box environments
         self.obs_low = torch.FloatTensor(env.observation_space.low)
         self.obs_high = torch.FloatTensor(env.observation_space.high)
 
@@ -130,31 +129,20 @@ class QNetwork(nn.Module):
         nn.init.constant_(out.bias, 0.0)
 
     def forward(self, x):
-        # Handle input shape: expect (batch, H, W, C) or (H, W, C)
-        # Convert to PyTorch conv format: (batch, C, H, W)
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
 
-        # Add batch dimension if needed
-        if len(x.shape) == 3:  # (H, W, C)
-            x = x.unsqueeze(0)  # (1, H, W, C)
-
-        # Permute to PyTorch conv format: (batch, H, W, C) -> (batch, C, H, W)
         x = x.permute(0, 3, 1, 2)
 
-        # General normalization for any Box environment
-        # Normalize to [0, 1] using the observation space bounds
         device = x.device
         obs_low = self.obs_low.to(device)
         obs_high = self.obs_high.to(device)
 
-        # Reshape bounds to match conv format and input tensor shape
-        # obs_low/obs_high are (H, W, C), need to match x which is (batch, C, H, W)
         batch_size = x.shape[0]
 
-        # Permute bounds to (C, H, W) then add batch dimension
         obs_low = obs_low.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
         obs_high = obs_high.permute(2, 0, 1).unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-        # Handle case where low and high might be the same (avoid division by zero)
         range_vals = obs_high - obs_low
         range_vals = torch.where(range_vals == 0, torch.ones_like(range_vals), range_vals)
 
@@ -210,7 +198,6 @@ class DQN:
             return random.randrange(self.a_dim)
 
         with torch.no_grad():
-            # Convert state to tensor - network handles shape transformation internally
             if isinstance(state, np.ndarray):
                 state_tensor = torch.FloatTensor(state).to(self.device)
             else:
@@ -243,11 +230,9 @@ class DQN:
         self.optimizer.zero_grad()
         loss.backward()
 
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_value_(self.q_network.parameters(), 100)
         self.optimizer.step()
 
-        # Return diagnostic information
         diagnostics = {
             'loss': loss.item(),
             'q_mean': current_q_values.mean().item(),

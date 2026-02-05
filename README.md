@@ -1,6 +1,14 @@
 # Continual Reinforcement Learning
 Repository to experiment with Continual Reinforcement Learning (CRL)
 
+# Installation
+1. install [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
+2.
+```bash
+micromamba create -f environment.yml -y
+micromamba activate crl
+```
+
 # Getting Started
 
 This project uses `uv` for dependency management. To get started:

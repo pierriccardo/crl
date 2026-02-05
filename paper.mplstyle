@@ -1,0 +1,88 @@
+# Matplotlib style for academic papers
+# Optimized for readability, color-blind accessibility, and print quality
+
+# Figure properties
+figure.figsize: 6, 4
+figure.dpi: 300
+figure.autolayout: False
+figure.constrained_layout.use: True
+
+# Font properties - use serif fonts for papers
+font.family: serif
+font.serif: Times New Roman, DejaVu Serif, Bitstream Vera Serif, Computer Modern Roman
+font.size: 10
+axes.labelsize: 11
+axes.titlesize: 12
+xtick.labelsize: 10
+ytick.labelsize: 10
+legend.fontsize: 9
+figure.titlesize: 13
+
+# Line properties
+lines.linewidth: 2.0
+lines.markersize: 6
+lines.markeredgewidth: 1.0
+
+# Color cycle - Paul Tol's vibrant color scheme (color-blind friendly)
+# These colors work well in grayscale too
+# axes.prop_cycle: cycler('color', ['0077BB', 'CC3311', '009988', 'EE7733', 'EE3377', '33BBEE', 'BBBBBB']) + cycler('marker', ['o', 's', '^', 'D', 'v', 'p', '*']) + cycler('linestyle', ['-', '-', '-', '-', '-', '-', '-'])
+axes.prop_cycle: cycler('color', ['E69F00', '56B4E9', '009E73', 'CC79A7', 'EE3377', '33BBEE', 'BBBBBB']) + cycler('marker', ['o', 's', '^', 'D', 'v', 'p', '*']) + cycler('linestyle', ['-', '-', '-', '-', '-', '-', '-'])
+
+
+
+# #E69F00
+# #56B4E9
+# #009E73
+# #CC79A7
+
+# Grid
+axes.grid: True
+axes.grid.axis: both
+grid.alpha: 0.3
+grid.linewidth: 0.5
+grid.linestyle: --
+grid.color: gray
+
+# Axes
+axes.linewidth: 1.0
+axes.edgecolor: black
+axes.labelcolor: black
+axes.axisbelow: True
+axes.spines.top: False
+axes.spines.right: False
+
+# Ticks
+xtick.direction: in
+ytick.direction: in
+xtick.major.size: 4
+ytick.major.size: 4
+xtick.minor.size: 2
+ytick.minor.size: 2
+xtick.major.width: 1.0
+ytick.major.width: 1.0
+xtick.color: black
+ytick.color: black
+
+# Legend
+legend.frameon: True
+legend.framealpha: 0.9
+legend.fancybox: False
+legend.edgecolor: black
+legend.shadow: False
+legend.borderpad: 0.5
+legend.labelspacing: 0.4
+legend.handlelength: 2.0
+legend.handletextpad: 0.5
+legend.columnspacing: 1.0
+
+# Save figure properties
+savefig.dpi: 300
+savefig.format: pdf
+savefig.bbox: tight
+savefig.pad_inches: 0.05
+savefig.transparent: False
+
+# LaTeX rendering (optional - uncomment if you have LaTeX installed)
+# text.usetex: True
+# text.latex.preamble: \usepackage{amsmath}
+

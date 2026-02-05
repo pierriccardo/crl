@@ -1,6 +1,213 @@
 import gymnasium as gym
 from gymnasium import spaces
+import metaworld
 import numpy as np
+
+import metaworld
+
+from minigrid.core.grid import Grid
+from minigrid.core.mission import MissionSpace
+from minigrid.core.world_object import Goal, Key, Lava, Wall
+from minigrid.minigrid_env import MiniGridEnv
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, Any
+
+import gymnasium as gym
+import numpy as np
+
+
+TASKS = ("reachgreen", "reachblue", "pickupkey")
+
+
+class MultiTaskGridEnv(MiniGridEnv):
+    """
+    Fixed grid + fixed dynamics. Only the reward function changes based on task_name.
+    """
+
+    def __init__(
+        self,
+        task_name: str,
+        size: int = 9,
+        max_steps: Optional[int] = None,
+        render_mode: Optional[str] = None,
+        seed: int = 0,
+        **kwargs,
+    ):
+        assert task_name in TASKS, f"Unknown task_name={task_name}. Valid: {TASKS}"
+        self.task_name = task_name
+        self._np_rng = np.random.default_rng(seed)
+
+        mission_space = MissionSpace(mission_func=lambda: str(self.task_name))
+
+        if max_steps is None:
+            # MiniGrid convention: O(size^2)
+            max_steps = 4 * size * size
+
+        super().__init__(
+            mission_space=mission_space,
+            grid_size=size,
+            max_steps=max_steps,
+            render_mode=render_mode,
+            agent_view_size=size,  # Full observability: see entire grid
+            see_through_walls=True,  # Can see through obstacles
+            **kwargs,
+        )
+
+        # Track events for reward computation
+        self._picked_up_key = False
+
+        # Fixed placements (set in _gen_grid)
+        self._green_goal_pos: Optional[Tuple[int, int]] = None
+        self._blue_goal_pos: Optional[Tuple[int, int]] = None
+        self._key_pos: Optional[Tuple[int, int]] = None
+
+    def _make_mission(self) -> str:
+        # Mission string is not used for reward; it is just for documentation/debug.
+        return f"task={self.task_name}"
+
+    def _gen_grid(self, width: int, height: int) -> None:
+        # Fixed grid, no randomness unless you add it.
+        self.grid = Grid(width, height)
+
+        # Surrounding walls
+        self.grid.wall_rect(0, 0, width, height)
+
+        # Interior layout (example: a couple of walls + lava strip)
+        for x in range(2, width - 2):
+            self.grid.set(x, 3, Wall())
+
+        for x in range(2, width - 2):
+            self.grid.set(x, height - 3, Lava())
+
+        # Place two goals and a key at fixed coordinates
+        self._green_goal_pos = (width - 2, 1)
+        self._blue_goal_pos = (1, height - 2)
+        self._key_pos = (width // 2, height // 2)
+
+        g = Goal()
+        g.color = "green"
+        self.put_obj(g, *self._green_goal_pos)
+
+        b = Goal()
+        b.color = "blue"
+        self.put_obj(b, *self._blue_goal_pos)
+
+        k = Key("yellow")
+        self.put_obj(k, *self._key_pos)
+
+        # Fixed agent start
+        self.agent_pos = (1, 1)
+        self.agent_dir = 0  # 0:right, 1:down, 2:left, 3:up
+
+        self._picked_up_key = False
+
+    def reset(self, **kwargs):
+        obs, info = super().reset(**kwargs)
+        info = dict(info)
+        info["task_name"] = self.task_name
+        return obs, info
+
+    def step(self, action):
+        # Cache s_t info you need
+        prev_pos = tuple(self.agent_pos)
+        prev_carrying_key = (self.carrying is not None and isinstance(self.carrying, Key))
+
+        obs, base_reward, terminated, truncated, info = super().step(action)
+
+        # Cache s_{t+1} info
+        new_pos = tuple(self.agent_pos)
+        new_carrying_key = (self.carrying is not None and isinstance(self.carrying, Key))
+
+        # Dense task reward
+        reward = self._dense_reward(prev_pos, new_pos, prev_carrying_key, new_carrying_key)
+
+        info = dict(info)
+        info["task_name"] = self.task_name
+        return obs, reward, terminated, truncated, info
+
+
+    def _dense_reward(self, prev_pos, new_pos, prev_has_key, new_has_key) -> float:
+        # Hyperparameters (tune as needed)
+        alpha = 1.0      # shaping strength
+        step_pen = 0.01  # living cost
+        lava_pen = 0.2   # penalty if on lava
+        pickup_bonus = 0.2  # bonus exactly when key is picked up
+
+        # Potential
+        phi_prev = self._phi(prev_pos, prev_has_key)
+        phi_new  = self._phi(new_pos,  new_has_key)
+
+        r = alpha * (phi_new - phi_prev) - step_pen
+
+        # Event bonus: just picked up key
+        if (not prev_has_key) and new_has_key:
+            r += pickup_bonus
+
+        # Lava penalty based on current cell
+        cell = self.grid.get(*new_pos)
+        if isinstance(cell, Lava):
+            r -= lava_pen
+
+        # Safety check: ensure reward is not NaN or Inf
+        if not np.isfinite(r):
+            r = 0.0
+
+        return float(r)
+
+
+    def _phi(self, pos, has_key: bool) -> float:
+        # Normalizer for distance -> [0,1]
+        D = (self.width - 1) + (self.height - 1)
+
+        # Guard against division by zero
+        if D <= 0:
+            return 0.0
+
+        def manhattan(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        if self.task_name == "reachgreen":
+            target = self._green_goal_pos
+            if target is None:
+                return 0.0
+            d = manhattan(pos, target)
+            return 1.0 - (d / D)
+
+        if self.task_name == "reachblue":
+            target = self._blue_goal_pos
+            if target is None:
+                return 0.0
+            d = manhattan(pos, target)
+            return 1.0 - (d / D)
+
+        if self.task_name == "pickupkey":
+            # Dense progress: go to key, then (optionally) go to green goal after pickup
+            if not has_key:
+                target = self._key_pos
+            else:
+                target = self._green_goal_pos
+            if target is None:
+                return 0.0
+            d = manhattan(pos, target)
+            return 1.0 - (d / D)
+
+        # Fallback
+        return 0.0
+
+    def set_task(self, task_name: str) -> None:
+        if task_name not in TASKS:
+            raise ValueError(f"Unknown task_name={task_name}. Valid: {TASKS}")
+        self.task_name = task_name
+        # No need to regenerate grid because dynamics/layout are fixed and only reward changes.
+
+    @property
+    def task(self) -> str:
+        return self.task_name
+
+    @task.setter
+    def task(self, value: str) -> None:
+        self.set_task(value)
 
 
 class DMControlEnv(gym.Env):
@@ -56,7 +263,9 @@ class DMControlEnv(gym.Env):
             )
 
     def _get_obs(self, time_step):
-        """Extract observation from dm_control TimeStep."""
+        """dm_control TimeStep uses OrderedDict (or pixels if image) to
+        store observation this function convert them in an array format.
+        """
         if self.from_pixels:
             obs = self._env.physics.render(
                 height=self.height,
@@ -66,19 +275,15 @@ class DMControlEnv(gym.Env):
             return obs
         else:
             # Flatten and concatenate all observation components
-            obs_list = []
-            for key in sorted(time_step.observation.keys()):
-                obs_list.append(np.array(time_step.observation[key]).flatten())
-            return np.concatenate(obs_list).astype(np.float32)
+            # TODO: time_step.observation is an OrderedDict, is order preserved? I think so
+            return np.concatenate([
+                np.array(v).flatten() for _, v in time_step.observation.items()
+            ]).astype(np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         if seed is not None:
-            # dm_control uses random_state for seeding
-            # Set both numpy and dm_control's random state
             np.random.seed(seed)
-            # dm_control environments have their own random state
-            # This is a best-effort seeding approach
             try:
                 self._env.task.random.seed(seed)
             except AttributeError:
@@ -89,7 +294,6 @@ class DMControlEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        # Ensure action is the right shape
         if isinstance(action, (int, float)):
             action = np.array([action], dtype=np.float32)
         elif not isinstance(action, np.ndarray):
@@ -128,154 +332,216 @@ class DMControlEnv(gym.Env):
     def close(self):
         self._env.close()
 
+# ----------------------------
+# 1) Minimal base env:
+#    - Accepts task token like "dist:0"
+#    - Uses it to configure how w is sampled each episode
+# ----------------------------
 
-class ContinualWorldEnv(gym.Env):
-    """Gymnasium wrapper for Continual World (MetaWorld) environments."""
+class SimpleDistAsTaskEnv(gym.Env):
+    """
+    Dynamics:
+      s_{t+1} = tanh(A s_t + B a_t) + noise
 
-    metadata = {"render_modes": ["rgb_array", "human"]}
+    Reward:
+      r_t = w^T phi(s_t, a_t, s_{t+1})
 
-    def __init__(self, task="hammer-v1", render_mode=None):
+    Task token:
+      task = "dist:k" selects distribution parameters used to sample w each episode.
+      This makes "distribution" compatible with your existing "task sequence" logic.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        state_dim: int = 8,
+        action_dim: int = 2,
+        feat_dim: int = 4,
+        max_episode_steps: int = 20,
+        noise_std: float = 0.01,
+        seed: int = 0,
+        task: Optional[str] = None,
+        render_mode: Optional[str] = None,
+        dist_specs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         super().__init__()
-        try:
-            # MetaWorld V3 API: Import environment classes directly
-            # Convert task name from "hammer-v1" to "SawyerHammerEnvV3"
-            task_name = task.replace("-v1", "").replace("-v2", "").replace("-v3", "")
-            # Convert to class name format: "hammer" -> "SawyerHammerEnvV3"
-            # Handle special cases
-            task_mapping = {
-                "hammer": "SawyerHammerEnvV3",
-                "push": "SawyerPushEnvV3",
-                "door-open": "SawyerDoorEnvV3",
-                "door-close": "SawyerDoorCloseEnvV3",
-                "drawer-close": "SawyerDrawerCloseEnvV3",
-                "drawer-open": "SawyerDrawerOpenEnvV3",
-                "reach": "SawyerReachEnvV3",
-                "push-wall": "SawyerPushWallEnvV3",
-                "shelf-place": "SawyerShelfPlaceEnvV3",
-                "button-press": "SawyerButtonPressEnvV3",
-                "button-press-topdown": "SawyerButtonPressTopdownEnvV3",
-                "button-press-topdown-wall": "SawyerButtonPressTopdownWallEnvV3",
-                "peg-insert-side": "SawyerPegInsertionSideEnvV3",
-                "window-open": "SawyerWindowOpenEnvV3",
-                "window-close": "SawyerWindowCloseEnvV3",
-                "reach-wall": "SawyerReachWallEnvV3",
-                "push-back": "SawyerPushBackEnvV3",
-                "lever-pull": "SawyerLeverPullEnvV3",
-                "box-close": "SawyerBoxCloseEnvV3",
-                "hand-insert": "SawyerHandInsertEnvV3",
+        self.n = int(state_dim)
+        self.m = int(action_dim)
+        self.d = int(feat_dim)
+        self.H = int(max_episode_steps)
+        self.noise_std = float(noise_std)
+
+        self.rng = np.random.default_rng(seed)
+
+        # Fixed fast dynamics
+        A = self.rng.normal(size=(self.n, self.n)).astype(np.float32)
+        B = self.rng.normal(size=(self.n, self.m)).astype(np.float32)
+        A *= 0.7 / (np.linalg.norm(A, 2) + 1e-6)
+        B *= 0.7 / (np.linalg.norm(B, 2) + 1e-6)
+        self.A, self.B = A, B
+
+        self.action_space = spaces.Box(-1.0, 1.0, shape=(self.m,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(self.n,), dtype=np.float32)
+
+        # Distribution specs keyed by task token, e.g. "dist:0"
+        self.dist_specs: Dict[str, Dict[str, Any]] = dist_specs or {}
+        if not self.dist_specs:
+            # default single distribution if none provided
+            self.dist_specs = {
+                "dist:0": {"w_std": 0.2, "mu_drift_std": 0.05},
             }
 
-            class_name = task_mapping.get(task_name)
-            if class_name is None:
-                # Try to construct class name automatically
-                # "hammer" -> "SawyerHammerEnvV3"
-                parts = task_name.split("-")
-                camel_case = "".join(word.capitalize() for word in parts)
-                class_name = f"Sawyer{camel_case}EnvV3"
+        # Current "distribution task"
+        self.task_id: str = "dist:0"
+        self.task_id_int: int = 0
 
-            # Import the environment class
-            from metaworld.envs import __dict__ as env_dict
-            env_cls = env_dict.get(class_name)
+        # Distribution parameters (configured via set_task)
+        self.w_std = 0.2
+        self.mu_drift_std = 0.05
 
-            if env_cls is None:
-                raise ValueError(
-                    f"Task '{task}' (class '{class_name}') not found in MetaWorld V3. "
-                    f"Available classes: {[k for k in env_dict.keys() if 'EnvV3' in k][:10]}"
-                )
+        # Distribution state: mean of Gaussian over w
+        self.mu = np.zeros((self.d,), dtype=np.float32)
 
-            # Create environment instance
-            self._env = env_cls()
-            # For V3 environments, we need to initialize _last_rand_vec before reset
-            # This is required for V3 environments to work properly
-            if hasattr(self._env, '_random_reset_space') and hasattr(self._env, '_last_rand_vec'):
-                # Sample a random task vector and set it as _last_rand_vec
-                # This initializes the environment's random state
-                self._env._last_rand_vec = self._env._random_reset_space.sample()
-            elif hasattr(self._env, 'sample_tasks'):
-                # Fallback for environments that have sample_tasks method
-                task_obj = self._env.sample_tasks(1)[0]
-                self._env.set_task(task_obj)
+        # Current episode task vector w
+        self.w = np.zeros((self.d,), dtype=np.float32)
 
-        except (ImportError, AttributeError, ValueError) as e:
-            # Fallback to ML1 API (older versions or if V3 not available)
-            try:
-                from metaworld import ML1
-                ml1 = ML1(task)
-                self._env = ml1.train_classes[task]()
-                self._task = ml1.train_tasks[0]
-                self._env.set_task(self._task)
-            except ImportError:
-                raise ImportError(
-                    "metaworld is required for ContinualWorldEnv. "
-                    "Install it with: pip install metaworld"
-                )
-            except Exception as fallback_error:
-                raise ValueError(
-                    f"Failed to create MetaWorld environment for task '{task}'. "
-                    f"V3 error: {e}. ML1 fallback error: {fallback_error}. "
-                    f"Make sure the task name is correct for your MetaWorld version."
-                )
+        # Episode state
+        self.t = 0
+        self.s = np.zeros((self.n,), dtype=np.float32)
 
-        self.render_mode = render_mode
-        self.task_name = task
-
-        # Action space
-        action_spec = self._env.action_space
-        self.action_space = spaces.Box(
-            low=action_spec.low,
-            high=action_spec.high,
-            shape=action_spec.shape,
-            dtype=np.float32
-        )
-
-        # Observation space (state-based, not pixels)
-        obs_spec = self._env.observation_space
-        self.observation_space = spaces.Box(
-            low=obs_spec.low,
-            high=obs_spec.high,
-            shape=obs_spec.shape,
-            dtype=np.float32
-        )
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        if seed is not None:
-            # MetaWorld uses numpy random state
-            np.random.seed(seed)
-            try:
-                self._env.random.seed(seed)
-            except AttributeError:
-                pass
-
-        # For V3 environments, sample a new random task vector on each reset
-        # This ensures each episode has a different goal/task
-        if hasattr(self._env, '_random_reset_space') and hasattr(self._env, '_last_rand_vec'):
-            self._env._last_rand_vec = self._env._random_reset_space.sample()
-
-        obs = self._env.reset()
-        return obs.astype(np.float32), {}
-
-    def step(self, action):
-        # Ensure action is the right shape and type
-        if not isinstance(action, np.ndarray):
-            action = np.array(action, dtype=np.float32)
+        # Apply initial task token if provided
+        if task is not None:
+            self.set_task(task)
         else:
-            action = action.astype(np.float32)
+            self.set_task(self.task_id)
 
-        # MetaWorld returns (obs, reward, done, info) not (obs, reward, terminated, truncated, info)
-        obs, reward, done, info = self._env.step(action)
-        # Convert to Gymnasium format: done -> terminated, no truncation
-        terminated = bool(done)
-        truncated = False
-        return obs.astype(np.float32), float(reward), terminated, truncated, info
+    def set_task(self, task_token: str) -> None:
+        """
+        Task token is interpreted as selecting a distribution spec.
+        Example tokens: "dist:0", "dist:1", ...
+        """
+        if task_token not in self.dist_specs:
+            raise ValueError(f"Unknown task_token={task_token}. Known: {list(self.dist_specs.keys())}")
 
-    def render(self):
-        if self.render_mode == "rgb_array":
-            return self._env.render(offscreen=True, camera_name="corner")
-        elif self.render_mode == "human":
-            return self._env.render(offscreen=False, camera_name="corner")
-        return None
+        self.task_id = task_token
 
-    def close(self):
-        if hasattr(self._env, 'close'):
-            self._env.close()
+        # Parse integer id for plotting compatibility
+        # If token not in form "dist:k", fallback to 0.
+        try:
+            self.task_id_int = int(task_token.split(":", 1)[1])
+        except Exception:
+            self.task_id_int = 0
+
+        spec = self.dist_specs[task_token]
+
+        self.w_std = float(spec.get("w_std", self.w_std))
+        self.mu_drift_std = float(spec.get("mu_drift_std", self.mu_drift_std))
+
+        if bool(spec.get("reset_mu", False)):
+            self.mu[:] = 0.0
+
+    def _phi(self, s: np.ndarray, a: np.ndarray, sp: np.ndarray) -> np.ndarray:
+        """
+        Cheap feature map.
+        Must output shape (d,).
+        """
+        base = np.array(
+            [
+                1.0,
+                -np.mean(a * a),
+                -np.mean(sp * sp),
+                np.mean(s * sp),
+                np.mean(sp[:8]),
+            ],
+            dtype=np.float32,
+        )
+
+        if self.d <= base.shape[0]:
+            return base[: self.d].copy()
+
+        phi = np.zeros((self.d,), dtype=np.float32)
+        phi[: base.shape[0]] = base
+        k = min(self.d - base.shape[0], 8)
+        phi[base.shape[0] : base.shape[0] + k] = np.tanh(sp[:k]).astype(np.float32)
+        return phi
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+        # Do not reseed here unless explicitly requested; for benchmarking you usually do not pass seed repeatedly.
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+
+        self.t = 0
+
+        # Drift mean each episode (how fast mu changes depends on current "distribution task")
+        # This creates an episode-level drifting distribution, but the speed changes when task token changes.
+        if self.mu_drift_std > 0:
+            self.mu = (self.mu + self.mu_drift_std * self.rng.normal(size=(self.d,))).astype(np.float32)
+
+        # Sample w for the episode from current distribution
+        self.w = (self.mu + self.w_std * self.rng.normal(size=(self.d,))).astype(np.float32)
+        self.w = (self.w / (np.linalg.norm(self.w) + 1e-6)).astype(np.float32)
+
+        self.s = self.rng.normal(scale=0.2, size=(self.n,)).astype(np.float32)
+
+        info = {
+            "task_id": self.task_id,
+            "task_id_int": self.task_id_int,
+        }
+        return self.s.copy(), info
+
+    def step(self, action: np.ndarray):
+        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+
+        noise = self.rng.normal(scale=self.noise_std, size=(self.n,)).astype(np.float32)
+        sp = (np.tanh(self.A @ self.s + self.B @ a).astype(np.float32) + noise)
+
+        phi = self._phi(self.s, a, sp)
+        r = float(self.w @ phi)
+
+        self.s = sp
+        self.t += 1
+
+        terminated = False
+        truncated = (self.t >= self.H)
+
+        info = {
+            "task_id": self.task_id,
+            "task_id_int": self.task_id_int,
+            #"phi": phi,
+        }
+        return self.s.copy(), r, terminated, truncated, info
+
+# ==================================================
+# Minihack Environments
+# ==================================================
+
+from minihack import LevelGenerator
+from minihack.reward_manager import Event
+
+
+class DenseCoordEvent(Event):
+    def __init__(self, coordinates: np.ndarray, gamma=0.99, scale=0.01):
+        super().__init__(
+            reward=0.0,
+            repeatable=False,
+            terminal_required=True,
+            terminal_sufficient=True
+        )
+        self.goal = coordinates
+
+    def check(self, env, previous_observation, action, observation) -> float:
+        coordinates = np.array(observation[env._blstats_index][:2])
+        distance = np.linalg.norm(coordinates - self.goal)
+        if np.array_equal(coordinates, self.goal):
+            return self._set_achieved()
+
+        return -distance
+
+lvl_gen = LevelGenerator(w=20, h=20)
+lvl_gen.add_object("apple", "%", (2, 2))
+lvl_gen.add_object("dagger", ")", (3, 3))
+lvl_gen.add_trap(name="teleport")
+lvl_gen.add_sink()
+lvl_gen.add_monster("goblin")
+lvl_gen.fill_terrain("rect", "|", 0, 0, 19, 19)

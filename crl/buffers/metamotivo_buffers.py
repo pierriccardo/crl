@@ -184,12 +184,10 @@ class TrajectoryBuffer:
             )
         num_slices = batch_size // self.seq_length
 
-        # Only sample from filled slots (indices 0 to len(self)-1)
         num_filled = len(self)
         if num_filled == 0:
             raise ValueError("Cannot sample from empty buffer")
 
-        # Create priorities only for filled slots
         filled_priorities = self.priorities[:num_filled] / self.priorities[:num_filled].sum()
         self.ep_ind = torch.multinomial(filled_priorities, num_slices, replacement=True)
         output = defaultdict(list)
@@ -249,8 +247,8 @@ def dtype_numpytotorch(np_dtype: Any) -> torch.dtype:
         return np_dtype
     if np_dtype == np.float16:
         return torch.float16
-    elif np_dtype == np.float32:
-        return torch.float32
+    elif np_dtype == np.float64:
+        return torch.float64
     elif np_dtype == np.float32:
         return torch.float32
     elif np_dtype == np.int16:

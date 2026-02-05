@@ -15,7 +15,6 @@ from typing import Dict, List, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set plotting style
 plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
@@ -204,13 +203,11 @@ def plot_performance_matrices(args: Args, results: dict, save_path: Optional[str
             axes[i].set_xlabel('Task Evaluated')
             axes[i].set_ylabel('Task Learned')
 
-            # Set tick labels
             axes[i].set_xticks(range(len(args.task_list)))
             axes[i].set_yticks(range(len(args.task_list)))
             axes[i].set_xticklabels([t.replace('_', ' ').title() for t in args.task_list], rotation=45)
             axes[i].set_yticklabels([t.replace('_', ' ').title() for t in args.task_list])
 
-            # Disable grid lines to prevent them from overriding text annotations
             axes[i].grid(False)
 
             # Add text annotations
@@ -239,25 +236,21 @@ def compute_continual_metrics(args: Args, performance_matrix: np.ndarray) -> Dic
     """Compute continual learning metrics from performance matrix."""
     n_tasks = len(args.task_list)
 
-    # Learning Accuracy - average diagonal performance
     diagonal_values = []
     for i in range(n_tasks):
         if not np.isnan(performance_matrix[i, i]):
             diagonal_values.append(performance_matrix[i, i])
     learning_accuracy = np.mean(diagonal_values) if diagonal_values else 0
 
-    # Forward Transfer - improvement on new tasks
     forward_transfer = 0
     ft_count = 0
     for i in range(1, n_tasks):  # Skip first task
         if not np.isnan(performance_matrix[i, i]):
-            # Compare with baseline (assume 0 or use first task performance)
             baseline = 0
             forward_transfer += performance_matrix[i, i] - baseline
             ft_count += 1
     forward_transfer = forward_transfer / ft_count if ft_count > 0 else 0
 
-    # Backward Transfer - final vs initial performance
     backward_transfer = 0
     bt_count = 0
     for i in range(n_tasks):
@@ -268,7 +261,6 @@ def compute_continual_metrics(args: Args, performance_matrix: np.ndarray) -> Dic
             bt_count += 1
     backward_transfer = backward_transfer / bt_count if bt_count > 0 else 0
 
-    # Average Forgetting
     average_forgetting = -backward_transfer
 
     return {
@@ -297,7 +289,6 @@ def create_metrics_table(args: Args, results: Dict, save_path: Optional[str] = N
                     all_metrics.append(metrics)
 
         if all_metrics:
-            # Average across seeds
             avg_metrics = {}
             for metric in ['forward_transfer', 'backward_transfer', 'learning_accuracy', 'average_forgetting']:
                 values = [m[metric] for m in all_metrics if not np.isnan(m[metric])]
@@ -334,7 +325,6 @@ def create_metrics_table(args: Args, results: Dict, save_path: Optional[str] = N
 def plot_all_results(args, output_dir: str = 'plots'):
     """Generate all plots and tables for the experiment results."""
 
-    # Create output directory
     Path(output_dir).mkdir(exist_ok=True)
 
     print(f"- Loading results for {args.env_name}/{args.task_sequence}...")

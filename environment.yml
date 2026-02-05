@@ -1,0 +1,35 @@
+name: crl310
+channels:
+  - conda-forge
+dependencies:
+  # Python
+  - python=3.10
+
+  # OS deps
+  - bzip2
+
+  - cmake
+  - make
+  - pkg-config
+  - gcc_linux-64
+  - gxx_linux-64
+
+  # Core scientific stack (binary compatibility)
+  - numpy
+  - pandas
+  - pyarrow
+  - matplotlib
+  - seaborn
+
+  # Utilities
+  - pip
+
+  # Python packages
+  - pip:
+    - gymnasium
+    - dm-control
+    - minihack
+    - metaworld
+    - tyro
+    - wandb
+    - tqdm

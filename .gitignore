@@ -1,9 +1,16 @@
 # Custom
 .DS_Store
+local/
+.uv_cache/
+.uv/
+.local/
+.cache/
+.tmp/
 results/
 wandb/
 plots/
 models/
+test.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
