@@ -1,15 +1,20 @@
-.PHONY: clean ppo_humanoid
+.PHONY: clean videos
 
 clean:
 	@echo "Cleaning experiment folders..."
 	rm -rf wandb/
 	rm -rf models/
 	rm -rf results/
+	rm -rf imgs/
 	@echo "All experiment folders cleaned!"
 
-ppo_humanoid:
-	python3 crl/algos/ppo.py \
-		--env.domain_name mujoco/humanoid \
-		--env.task crouch \
-		--env.seed 0 \
-		--seed 0
+videos:
+	python scripts/record_humanoid_ppo_videos.py \
+	--checkpoint models/mujoco-humanoid/walk_forward/ppo/seed_0 \
+	--task walk_backward \
+	--episodes 3
+
+	python scripts/record_humanoid_ppo_videos.py \
+	--checkpoint models/mujoco-humanoid/stand/ppo/seed_0 \
+	--task crouch \
+	--episodes 3

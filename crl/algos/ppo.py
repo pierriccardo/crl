@@ -1,9 +1,30 @@
 """
-PPO implementation
-- GAE https://github.com/zplizzi/pytorch-ppo/blob/main/gae.py
+Proximal Policy Optimization (PPO)
+
+In PPO the agent interacts with the environment for T steps (the `horizon`), the data collected in these steps is called a rollout.
+One rollout is a batch of data used for the update. If we use N agents in parallel, we will have N rollouts and a batch of dim N*T.
+
+Once the agent has collected a rollout, we can update the policy and value function. The update is performed by separating the
+rollout (of size N*T) into mini-batches (of size `minibatch_size`), then the mini-batches are shuffled and used to perform a gradient
+update step, updating the policy and value function. This is done until each mini-batch has been used for the update. This operation
+can be repeated for a number of `epochs`. Reusing the same data for different epochs improve sample efficiency.
+
+References:
+- Paper: https://arxiv.org/pdf/1707.06347
+- Code:
+    - https://github.com/zplizzi/pytorch-ppo
+    - https://github.com/openai/spinningup/blob/master/spinup/algos/pytorch/ppo/ppo.py
+    - https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo.py
+    - (GAE) https://github.com/zplizzi/pytorch-ppo/blob/main/gae.py
+
+Additional references:
+- [Ref 1] https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/?utm_source=chatgpt.com
+- https://arxiv.org/pdf/2005.12729
+- https://arxiv.org/abs/2006.05990
+- https://blog.xa0.de/post/PPO%20---%20a-Note-on-Policy-Entropy-in-Continuous-Action-Spaces
+
 """
-
-
+import os
 import tyro
 import wandb
 import random
@@ -13,13 +34,16 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 
-import os
+from tqdm import tqdm
+from collections import deque
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Tuple, List, Any
-from tqdm import tqdm
 
-from crl.envs import EnvConfig, make_env
+
+from crl.envs import EnvConfig, make_env, get_env_dims
 
 
 def get_checkpoint_dir(
@@ -43,12 +67,13 @@ def get_checkpoint_dir(
 class Config:
     seed: int = 0
     device: str = "cuda"
-
     env: EnvConfig = field(default_factory=EnvConfig)
 
     # Set dynamically from environment
     s_dim: int = -1
     a_dim: int = -1
+    action_low: torch.Tensor = torch.tensor([-1.0])
+    action_high: torch.Tensor = torch.tensor([1.0])
     discrete_actions: bool = False
 
     a_lr: float = 3e-4
@@ -62,9 +87,17 @@ class Config:
     vf_coef: float = 0.5
 
     # train
-    epochs: int = 1000
-    batch_size: int = 4096
+    n_steps: int = 100_000
+    n_epochs: int = 5
+    n_agents: int = 1  # Number of agents in parallel, N
+    batch_size: int = 4096  # A.k.a. horizon, T
     minibatch_size: int = 512
+
+    window_size: int = 100
+    log_freq: int = 100
+
+    # generic optimization parameters
+    clip_grad_norm: float | None = None  # usually 0.5
 
     # Wandb
     use_wandb: bool = True
@@ -73,7 +106,7 @@ class Config:
 
     # Checkpointing
     save_dir: str = "models"
-    save_every_epochs: Optional[int] = None  # None = only at end
+    save_every_steps: Optional[int] = None  # None = only at end
     load_checkpoint: Optional[str] = None    # path or dir to resume from
 
 
@@ -81,11 +114,40 @@ class Config:
 # Networks
 # ==================================================
 
+
+def init_mlp_weights(
+    module: nn.Module,
+    hidden_gain: Optional[float] = None,
+    last_gain: Optional[float] = None,
+    extra_layers: Optional[List[Tuple[nn.Module, float]]] = None,
+) -> None:
+    """
+    Orthogonal weight init for Linear layers in `module` (e.g. nn.Sequential).
+    - hidden_gain: gain for all but last layer (default: tanh).
+    - last_gain: if set, use this for the last Linear in `module` instead of hidden_gain.
+    - extra_layers: optional list of (layer, gain) for additional layers (e.g. policy head).
+    """
+    if hidden_gain is None:
+        hidden_gain = nn.init.calculate_gain("tanh")
+    linear_layers = [m for m in module if isinstance(m, nn.Linear)]
+    for i, m in enumerate(linear_layers):
+        gain = last_gain if (last_gain is not None and i == len(linear_layers) - 1) else hidden_gain
+        nn.init.orthogonal_(m.weight, gain=gain)
+        nn.init.zeros_(m.bias)
+    if extra_layers:
+        for layer, gain in extra_layers:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=gain)
+                nn.init.zeros_(layer.bias)
+
+
 class Actor(nn.Module):
 
-    def __init__(self, s_dim: int, a_dim: int, discrete: bool = False):
+    def __init__(self, s_dim: int, a_dim: int, action_low: torch.Tensor, action_high: torch.Tensor, discrete: bool = False):
         super().__init__()
         self.discrete = discrete
+        self.register_buffer("action_low", torch.as_tensor(action_low, dtype=torch.float32))
+        self.register_buffer("action_high", torch.as_tensor(action_high, dtype=torch.float32))
         self.net = nn.Sequential(
             nn.Linear(s_dim, 256),
             nn.Tanh(),
@@ -100,6 +162,11 @@ class Actor(nn.Module):
             self.mu_head = nn.Linear(256, a_dim)
             self.logstd = nn.Parameter(torch.zeros(a_dim))
 
+        init_mlp_weights(
+            self.net,
+            extra_layers=[(self.logits_head if self.discrete else self.mu_head, 0.01)],
+        )
+
     def get_dist(self, s: torch.Tensor) -> torch.distributions.Distribution:
         h = self.net(s)
         if self.discrete:
@@ -109,21 +176,35 @@ class Actor(nn.Module):
             mean = self.mu_head(h)
             logstd = self.logstd.expand_as(mean)
             std = torch.exp(logstd)
-            return torch.distributions.Normal(mean, std)
+            base = Normal(mean, std)
+            # Squash to (-1, 1) via tanh; log_prob and rsample use stable Jacobian inside PyTorch
+            return TransformedDistribution(base, TanhTransform(cache_size=1))
 
     def forward(self, s: torch.Tensor, action: torch.Tensor | None = None) -> torch.Tensor:
         dist = self.get_dist(s)
-        if action is None:
-            action = dist.sample()
-        logprob = dist.log_prob(action)
-        if not self.discrete:
-            # For continuous actions, sum over action dimensions
-            logprob = logprob.sum(dim=-1)
-        entropy = dist.entropy()
-        if not self.discrete:
-            # For continuous actions, sum over action dimensions
-            entropy = entropy.sum(dim=-1)
-        return action, logprob, entropy
+        if self.discrete:
+            action = dist.sample() if action is None else action
+            return action, dist.log_prob(action), dist.entropy()
+
+        else:
+            eps = 1e-6
+            if action is None:
+                a = dist.rsample()
+            else:
+                # action is in env scale [low, high]; map to (-1, 1)
+                a = (action - self.action_low) / (self.action_high - self.action_low)
+                a = 2.0 * a - 1.0
+
+            a = a.clamp(-1 + eps, 1 - eps)  # safe for atanh and log_prob
+            u = dist.transforms[0].inv(a)
+            logprob = dist.log_prob(a).sum(dim=-1)
+            base = dist.base_dist
+            log_det = dist.transforms[0].log_abs_det_jacobian(u, a)
+            entropy = base.entropy().sum(dim=-1) + log_det.sum(dim=-1)
+
+            # rescale action to env scale [low, high]
+            a_env = self.action_low + (a + 1.0) * 0.5 * (self.action_high - self.action_low)
+            return a_env, logprob, entropy
 
 class Critic(nn.Module):
 
@@ -136,6 +217,7 @@ class Critic(nn.Module):
             nn.Tanh(),
             nn.Linear(256, 1),
         )
+        init_mlp_weights(self.net, last_gain=1.0)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # Return value shape (B,)
@@ -152,20 +234,20 @@ class PPO:
 
         self.config = config
         self.device = config.device
-        self.actor = Actor(config.s_dim, config.a_dim, discrete=config.discrete_actions)
+        self.actor = Actor(config.s_dim, config.a_dim, config.action_low, config.action_high, discrete=config.discrete_actions)
         self.critic = Critic(config.s_dim)
 
         self.actor.to(self.device)
         self.critic.to(self.device)
 
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.a_lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.c_lr)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.a_lr, eps=1e-8, )
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.c_lr, eps=1e-8)
 
-    def act(self, s: torch.Tensor, values: bool = False) -> torch.Tensor:
+    def act(self, s: torch.Tensor, values: bool = False):
         action, logprob, entropy = self.actor(s)
         if values:
             return action, logprob, entropy, self.critic(s)
-        return action
+        return (action, logprob, entropy)
 
     def gae(self, rewards, values, dones):
         """
@@ -175,9 +257,9 @@ class PPO:
         T = rewards.shape[0]
         advantages = torch.zeros_like(rewards)
         advantage = 0
-        for t in reversed(range(T - 1)):
-            delta = rewards[t] + self.config.gamma * values[t+1] * (1 - dones[t+1]) - values[t]
-            advantage = delta + self.config.gamma * self.config.gae_lambda * advantage
+        for t in reversed(range(T)):
+            delta = rewards[t] + self.config.gamma * values[t+1] * (1 - dones[t]) - values[t]
+            advantage = delta + self.config.gamma * self.config.gae_lambda * (1 - dones[t]) * advantage
             advantages[t] = advantage
         return advantages
 
@@ -192,77 +274,100 @@ class PPO:
         - dones:    (T,)
         """
 
-        metrics = {
+        metrics = [{
             "pg_loss": 0,
             "v_loss": 0,
             "entropy_loss": 0,
             "actor_loss": 0,
             "critic_loss": 0,
-        }
+        } for _ in range(self.config.n_epochs)]
 
-        sgd_steps = 0
-        b_idxs = np.arange(self.config.batch_size)
         advantages = self.gae(rollout["rewards"], rollout["values"], rollout["dones"])
-        b_returns = advantages + rollout["values"]
+        b_returns = advantages + rollout["values"][:-1]
 
-        for start in range(0, self.config.batch_size, self.config.minibatch_size):
-            end = start + self.config.minibatch_size
-            mb_idxs = b_idxs[start:end]
+        if self.config.norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            _, newlogprobs, entropy = self.actor(rollout["obs"][mb_idxs], rollout["actions"][mb_idxs])
-            newvalue = self.critic(rollout["obs"][mb_idxs])
-            log_ratio = newlogprobs - rollout["logprobs"][mb_idxs]
-            ratio = torch.exp(log_ratio)
+        for epoch in range(self.config.n_epochs):
+            # Create a random permutation of indices shuffle the batch
+            indices = torch.randperm(self.config.batch_size)
 
-            mb_advantages = advantages[mb_idxs]
-            if self.config.norm_adv:
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+            sgd_steps = 0
+            for start_idx in range(0, self.config.batch_size, self.config.minibatch_size):
+                end_idx = start_idx + self.config.minibatch_size
+                mb_idxs = indices[start_idx:end_idx]
 
-            # Polivy update
-            pg_loss1 = -mb_advantages * ratio
-            pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            # Value loss
-            if self.config.clip_vloss:
-                v_loss_unclipped = (newvalue - b_returns[mb_idxs]) ** 2
-                v_clipped = rollout["values"][mb_idxs] + torch.clamp(
-                    newvalue - rollout["values"][mb_idxs],
-                    -self.config.clip_coef,
-                    self.config.clip_coef,
-                )
-                v_loss_clipped = (v_clipped - b_returns[mb_idxs]) ** 2
-                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = 0.5 * v_loss_max.mean()
-            else:
-                v_loss = 0.5 * ((newvalue - b_returns[mb_idxs]) ** 2).mean()
+                _, newlogprobs, entropy = self.actor(rollout["obs"][mb_idxs], rollout["actions"][mb_idxs])
+                newvalue = self.critic(rollout["obs"][mb_idxs])
+                log_ratio = newlogprobs - rollout["logprobs"][mb_idxs]
+                ratio = torch.exp(log_ratio)
 
-            # Entropy loss
-            entropy_loss = entropy.mean()
-            actor_loss = pg_loss - self.config.ent_coef * entropy_loss
-            critic_loss = v_loss * self.config.vf_coef
+                mb_advantages = advantages[mb_idxs]
 
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+                # Polivy update
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
+                # Value loss
+                if self.config.clip_vloss:
+                    v_loss_unclipped = (newvalue - b_returns[mb_idxs]) ** 2
+                    v_clipped = rollout["values"][mb_idxs] + torch.clamp(
+                        newvalue - rollout["values"][mb_idxs],
+                        -self.config.clip_coef,
+                        self.config.clip_coef,
+                    )
+                    v_loss_clipped = (v_clipped - b_returns[mb_idxs]) ** 2
+                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    v_loss = 0.5 * v_loss_max.mean()
+                else:
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_idxs]) ** 2).mean()
 
-            metrics["pg_loss"] += float(pg_loss.detach())
-            metrics["v_loss"] += float(v_loss.detach())
-            metrics["entropy_loss"] += float(entropy_loss.detach())
-            metrics["actor_loss"] += float(actor_loss.detach())
-            metrics["critic_loss"] += float(critic_loss.detach())
-            sgd_steps += 1
+                # Entropy loss
+                entropy_loss = entropy.mean()
+                actor_loss = pg_loss - self.config.ent_coef * entropy_loss
+                critic_loss = v_loss * self.config.vf_coef
+                total_loss = actor_loss + critic_loss
 
-        for m, v in metrics.items():
-            metrics[m] /= max(1, sgd_steps)
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                total_loss.backward()
+
+                if self.config.clip_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.actor.parameters()) + list(self.critic.parameters()),
+                        max_norm=self.config.clip_grad_norm
+                    )
+
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+
+                metrics[epoch]["pg_loss"] += float(pg_loss.detach())
+                metrics[epoch]["v_loss"] += float(v_loss.detach())
+                metrics[epoch]["entropy_loss"] += float(entropy_loss.detach())
+                metrics[epoch]["actor_loss"] += float(actor_loss.detach())
+                metrics[epoch]["critic_loss"] += float(critic_loss.detach())
+                sgd_steps += 1
+
+            for m, v in metrics[epoch].items():
+                metrics[epoch][m] /= max(1, sgd_steps)
+
+        results = {}
+        if self.config.n_epochs > 1:
+            # Metrics for first and last epoch for debugging
+            for e in [0, self.config.n_epochs - 1]:
+                for k, v in metrics[e].items():
+                    results[f"{k}_epoch_{e}"] = v
+        # Compute mean over epochs for each metric
+        mean_metrics = {}
+        for k in metrics[0].keys():
+            mean_metrics[k] = np.mean([metrics[epoch][k] for epoch in range(self.config.n_epochs)])
+        results.update(mean_metrics)
 
         # TODO: add explained variance
         # TODO: add KL divergence
-        return metrics
+        return results
 
     def save(
         self,
@@ -366,6 +471,7 @@ if __name__ == "__main__":
 
     config = tyro.cli(Config)
 
+    # Seeding everything
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -375,7 +481,7 @@ if __name__ == "__main__":
     if config.use_wandb:
         wandb.init(
             project=config.proj_name,
-            group=f"{config.env.domain_name}-{config.env.task_list}-s{config.env.seed}",
+            group=f"{config.env.domain_name}-{config.env.task}-s{config.env.seed}",
             name=f"{config.algo_name}-s{config.seed}",
             config=asdict(config)
         )
@@ -386,26 +492,15 @@ if __name__ == "__main__":
         seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
     )
 
-    if hasattr(env.observation_space, 'shape'):
-        if len(env.observation_space.shape) == 0:
-            obs_dim = 1
-        else:
-            obs_dim = int(np.prod(env.observation_space.shape))
-    else:
-        # Fallback: reset and check observation
-        obs, _ = env.reset()
-        obs_dim = int(np.prod(obs.shape))
+    s_dim, a_dim, discrete = get_env_dims(env)
+    config.s_dim = s_dim
+    config.a_dim = a_dim
 
-    if isinstance(env.action_space, gym.spaces.Discrete) or hasattr(env.action_space, 'n'):
-        action_dim = int(env.action_space.n)
-    elif hasattr(env.action_space, 'shape'):
-        if len(env.action_space.shape) == 0:
-            action_dim = 1
-        else:
-            action_dim = int(np.prod(env.action_space.shape))
-
-    config.s_dim = obs_dim
-    config.a_dim = action_dim
+    config.discrete_actions = discrete
+    if not discrete:
+        config.action_low = env.action_space.low
+        config.action_high = env.action_space.high
+        print(f"action_low: {config.action_low}, action_high: {config.action_high}")
 
     if config.load_checkpoint:
         agent, payload = PPO.from_checkpoint(config.load_checkpoint, device=config.device)
@@ -422,55 +517,81 @@ if __name__ == "__main__":
         base_dir=config.save_dir,
     )
 
-    obs_buffer = torch.zeros((config.batch_size, obs_dim)).to(config.device)
-    actions_buffer = torch.zeros((config.batch_size, action_dim)).to(config.device)
+    obs_buffer = torch.zeros((config.batch_size, s_dim)).to(config.device)
+    actions_buffer = (
+        torch.zeros((config.batch_size,), dtype=torch.long).to(config.device)
+        if config.discrete_actions
+        else torch.zeros((config.batch_size, a_dim)).to(config.device)
+    )
     logprobs_buffer = torch.zeros((config.batch_size)).to(config.device)
     rewards_buffer = torch.zeros((config.batch_size)).to(config.device)
     dones_buffer = torch.zeros((config.batch_size)).to(config.device)
-    values_buffer = torch.zeros((config.batch_size)).to(config.device)
+    values_buffer = torch.zeros((config.batch_size + 1)).to(config.device)
 
-    episode = 0
-    episode_reward = 0.0
+    step = 0
+    episode_idx = 0
+    episode_len = 0
+    episode_rew = 0.0
+    rewards = deque(maxlen=config.window_size)  # last N step rewards
+
     obs, info = env.reset()
 
-    for epoch in tqdm(range(start_epoch, config.epochs)):
+    for t in tqdm(range(config.n_steps)):
         with torch.no_grad():
-            for step in tqdm(range(config.batch_size)):
-                obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
-                action, logprob, entropy, value = agent.act(obs_tensor, values=True)
-                next_obs, reward, terminated, truncated, info = env.step(action.cpu().numpy()[0])
 
-                obs_buffer[step] = obs_tensor
-                actions_buffer[step] = action
-                logprobs_buffer[step] = logprob
-                rewards_buffer[step] = reward
-                dones_buffer[step] = terminated or truncated
-                values_buffer[step] = value
+            obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
+            action, logprob, entropy, value = agent.act(obs_tensor, values=True)
+            if config.discrete_actions:
+                a_env = int(action.item())
+            else:
+                a_env = action.cpu().numpy()[0]
+            next_obs, reward, terminated, truncated, info = env.step(a_env)
 
-                episode_reward += reward
-                obs = next_obs
+            obs_buffer[step] = obs_tensor.squeeze(0)
+            actions_buffer[step] = action.squeeze(0)
+            logprobs_buffer[step] = logprob.squeeze(0)
+            rewards_buffer[step] = reward
+            dones_buffer[step] = terminated #or truncated # Dones computed only with termination signal
+            values_buffer[step] = value.squeeze(0)
 
-                if terminated or truncated:
-                    episode += 1
-                    if config.use_wandb:
-                        wandb.log({"metrics/reward_per_episode": episode_reward}, step=episode)
-                    episode_reward = 0.0
-                    obs, _ = env.reset()
+            obs = next_obs
+            step += 1
+            rewards.append(reward)
+            episode_rew += reward
+            episode_len += 1
 
-        rollout = {
-            "obs": obs_buffer,
-            "actions": actions_buffer,
-            "logprobs": logprobs_buffer,
-            "rewards": rewards_buffer,
-            "dones": dones_buffer,
-            "values": values_buffer,
-        }
+            if terminated or truncated:
+                episode_idx += 1
+                if config.use_wandb:
+                    wandb.log({"metrics/reward_per_episode": episode_rew}, step=t)
+                    wandb.log({"metrics/episode_length": episode_len}, step=t)
+                episode_rew = 0.0
+                episode_len = 0
+                obs, _ = env.reset()
 
-        metrics = agent.update(rollout)
-        if config.use_wandb:
-            wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=episode)
+        if step == config.batch_size:
+            with torch.no_grad():
+                obs_T = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
+                values_buffer[step] = agent.critic(obs_T).squeeze(0)
+            rollout = {
+                "obs": obs_buffer,
+                "actions": actions_buffer,
+                "logprobs": logprobs_buffer,
+                "rewards": rewards_buffer,
+                "dones": dones_buffer,
+                "values": values_buffer,
+            }
+            metrics = agent.update(rollout)
+            if config.use_wandb:
+                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=t)
+            step = 0
 
-        if config.save_every_epochs and (epoch + 1) % config.save_every_epochs == 0:
-            agent.save(checkpoint_dir, epoch=epoch + 1)
+        if config.save_every_steps and (t + 1) % config.save_every_steps == 0:
+            # TODO: rename epoch to step
+            agent.save(checkpoint_dir, epoch=t + 1)
 
-    agent.save(checkpoint_dir, epoch=config.epochs)
+        if config.log_freq and (t + 1) % config.log_freq == 0 and rewards:
+            mean_reward = sum(rewards) / len(rewards)
+            wandb.log({f"metrics/reward_mean_last_{config.window_size}_steps": mean_reward}, step=t)
+
+    agent.save(checkpoint_dir, epoch=config.n_steps)

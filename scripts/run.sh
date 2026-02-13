@@ -4,14 +4,19 @@ env_seed=0
 
 # Run PPO on mujoco/humanoid for all tasks in HUMANOID_TASKS_SPEC (from crl.envs.tasks)
 PIDS=()
-tasks=(stand walk_forward run_forward crouch walk_backward run_backward turn_left turn_right jump)
+tasks=(stand walk_forward run_forward walk_backward strafe_left turn_in_place_left crouch pose_match_standing_reference)
 for task in "${tasks[@]}"; do
     python3 crl/algos/ppo.py \
         --env.domain_name mujoco/humanoid \
         --env.task "${task}" \
         --env.seed ${env_seed} \
         --seed 0 \
-        --epochs 2000 \
+        --n_steps 5_000_000 \
+        --n_epochs 5 \
+        --ent_coef 0.01 \
+        --batch_size 8192 \
+        --minibatch_size 512 \
+        --clip_grad_norm 0.5 \
         --device cuda \
         --use_wandb &
     PIDS+=($!)

@@ -8,7 +8,8 @@ from .factory import (
 )
 
 from .utils import (
-    EnvConfig
+    EnvConfig,
+    get_env_dims,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "list_task_sequences",
     "list_envs",
     "EnvConfig",
+    "get_env_dims",
 ]

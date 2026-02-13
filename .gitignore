@@ -11,6 +11,8 @@ wandb/
 plots/
 models/
 test.py
+videos/
+imgs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

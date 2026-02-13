@@ -12,7 +12,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
 from tqdm import tqdm
 
-from crl.envs import EnvConfig, make_continual_episodic_env, get_task_sequence
+from crl.envs import EnvConfig, make_continual_episodic_env, get_task_sequence, get_env_dims
 from crl.algos.ppo import PPO, Config as PPOConfig
 from crl.buffers import SimpleTrajBuffer
 
@@ -275,14 +275,18 @@ class VariBAD:
             z_pol = torch.zeros((obs.shape[0], self.config.z_dim), device=obs.device)
 
         obs_aug = torch.cat([obs, z_pol], dim=-1)
-
-        a, logp, entropy, v = self.ppo.act(obs_aug, values=values)
         info = {"z_pol": z_pol}
 
         if values:
+            a, logp, entropy, v = self.ppo.act(obs_aug, values=True)
             return a, logp, entropy, v, info
+        out = self.ppo.act(obs_aug, values=False)
+        if isinstance(out, tuple) and len(out) == 3:
+            a, logp, entropy = out
         else:
-            return a, logp, info
+            a = out if not isinstance(out, tuple) else out[0]
+            logp = entropy = None
+        return a, logp, info
 
     def update(self, rollout: dict, traj_buffer: Any, beta: float = 1.0):
         # Update PPO
@@ -307,6 +311,8 @@ class VariBAD:
         out.update({f"train/ppo/{k}": v for k, v in ppo_metrics.items()})
         out.update({f"train/vae/{k}": v for k, v in vae_metrics.items()})
         return out
+
+
 
 
 if __name__ == "__main__":
@@ -342,27 +348,16 @@ if __name__ == "__main__":
         seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
     )
 
-    if hasattr(env.observation_space, 'shape'):
-        if len(env.observation_space.shape) == 0:
-            obs_dim = 1
-        else:
-            obs_dim = int(np.prod(env.observation_space.shape))
-    else:
-        # Fallback: reset and check observation
-        obs, _ = env.reset()
-        obs_dim = int(np.prod(obs.shape))
+    s_dim, a_dim, discrete = get_env_dims(env)
+    config.s_dim = s_dim
+    config.a_dim = a_dim
+    config.discrete_actions = discrete
 
-    if isinstance(env.action_space, gym.spaces.Discrete) or hasattr(env.action_space, 'n'):
-        action_dim = int(env.action_space.n)
-    elif hasattr(env.action_space, 'shape'):
-        if len(env.action_space.shape) == 0:
-            action_dim = 1
-        else:
-            action_dim = int(np.prod(env.action_space.shape))
+    if not config.discrete_actions:
+        config.ppo.action_low = env.action_space.low
+        config.ppo.action_high = env.action_space.high
+        print(f"action_low: {config.ppo.action_low}, action_high: {config.ppo.action_high}")
 
-    config.s_dim = obs_dim
-    config.a_dim = action_dim
-    config.discrete = isinstance(env.action_space, gym.spaces.Discrete)
 
     # Auto-set VAE sequence length if not specified
     if config.vae_seq_length == -1:
@@ -381,15 +376,16 @@ if __name__ == "__main__":
         capacity_episodes=config.buffer_size
     )
 
-    obs_buffer = torch.zeros((config.ppo.batch_size, obs_dim + config.z_dim)).to(config.device)
+
+    obs_buffer = torch.zeros((config.ppo.batch_size + 1, config.s_dim + config.z_dim)).to(config.device)
     if config.discrete:
-        actions_buffer = torch.zeros((config.ppo.batch_size,), dtype=torch.long).to(config.device)
+        actions_buffer = torch.zeros((config.ppo.batch_size + 1,), dtype=torch.long).to(config.device)
     else:
-        actions_buffer = torch.zeros((config.ppo.batch_size, action_dim)).to(config.device)
-    logprobs_buffer = torch.zeros((config.ppo.batch_size)).to(config.device)
-    rewards_buffer = torch.zeros((config.ppo.batch_size)).to(config.device)
-    dones_buffer = torch.zeros((config.ppo.batch_size)).to(config.device)
-    values_buffer = torch.zeros((config.ppo.batch_size)).to(config.device)
+        actions_buffer = torch.zeros((config.ppo.batch_size + 1, config.a_dim)).to(config.device)
+    logprobs_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
+    rewards_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
+    dones_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
+    values_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
 
 
     global_step = 0
@@ -463,14 +459,14 @@ if __name__ == "__main__":
             prev_reward = reward
             obs = next_obs
 
-            if ppo_buffer_idx >= config.ppo.batch_size:
+            if ppo_buffer_idx == config.ppo.batch_size + 1:
                 rollout = {
-                    "obs": obs_buffer,
-                    "actions": actions_buffer,
-                    "logprobs": logprobs_buffer,
-                    "rewards": rewards_buffer,
-                    "dones": dones_buffer,
-                    "values": values_buffer,
+                    "obs": obs_buffer[:config.ppo.batch_size],
+                    "actions": actions_buffer[:config.ppo.batch_size],
+                    "logprobs": logprobs_buffer[:config.ppo.batch_size],
+                    "rewards": rewards_buffer[:config.ppo.batch_size],
+                    "dones": dones_buffer[:config.ppo.batch_size],
+                    "values": values_buffer[:config.ppo.batch_size + 1],
                 }
                 metrics = agent.update(rollout, replay_buffer)
                 #if config.use_wandb:

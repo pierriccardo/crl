@@ -26,7 +26,7 @@ from collections import deque
 from collections.abc import Mapping
 
 from crl.buffers import DictBuffer, ZBuffer, TrajectoryBuffer
-from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence, get_env_dims
+from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence
 
 print("cuda available:", torch.cuda.is_available())
 print("device count:", torch.cuda.device_count())
@@ -154,6 +154,12 @@ class FBcprTrainConfig(FBTrainConfig):
     weight_decay_discriminator: float = 0.0
 
 
+@dataclass
+class ExplorationConfig:
+    epsilon: float = .6
+    num_z_samples: int = 10 # number of zs for FBEE
+    f_uncertainty: bool = False
+
 @dataclasses.dataclass
 class Config:
     model: FBcprModelConfig = dataclasses.field(default_factory=FBcprModelConfig)
@@ -167,6 +173,8 @@ class Config:
     buffer_size: int = 100_000
     expert_buffer_size: int = 1000
     expert_buffer_max: int = 100  # Keep only top N episodes by reward on the expert
+    window_size: int = 15  # Inference sliding window
+    expl: ExplorationConfig = dataclasses.field(default_factory=ExplorationConfig)
     warmup_episodes: int = 20
 
     train_freq: int = 1  # episodes
@@ -188,6 +196,100 @@ class Config:
 # ==================================================
 # Helpers
 # ==================================================
+
+class TorchSlidingWindow:
+    """
+    Sliding window for (next_obs, reward) stored as torch tensors on a chosen device.
+    Provides a contiguous chronological view without per-call stacking.
+
+    Uses a mirrored buffer of length 2W so get() can return a slice view.
+    """
+    def __init__(self, window_len: int, obs_dim: int, device: str, obs_dtype=torch.float32):
+        self.W = int(window_len)
+        self.device = device
+        self.obs = torch.empty((2 * self.W, obs_dim), device=device, dtype=obs_dtype)
+        self.rew = torch.empty((2 * self.W, 1), device=device, dtype=torch.float32)
+        self.t = 0
+        self.filled = 0
+
+    @torch.no_grad()
+    def append(self, next_obs: np.ndarray | torch.Tensor, reward: float | np.ndarray | torch.Tensor):
+        # next_obs -> (obs_dim,)
+        i = self.t % self.W
+
+        # Direct copy for numpy arrays - much faster than torch.as_tensor
+        if isinstance(next_obs, np.ndarray):
+            # View as correct shape and copy directly into pre-allocated tensor
+            obs_flat = next_obs.ravel()
+            if obs_flat.shape[0] != self.obs.shape[1]:
+                raise ValueError(f"next_obs has {obs_flat.shape[0]} elems, expected {self.obs.shape[1]}")
+            self.obs[i].copy_(torch.from_numpy(obs_flat))
+            self.obs[i + self.W].copy_(self.obs[i])
+        else:
+            # Tensor case
+            x = next_obs.reshape(-1)
+            if x.numel() != self.obs.shape[1]:
+                raise ValueError(f"next_obs has {x.numel()} elems, expected {self.obs.shape[1]}")
+            self.obs[i].copy_(x)
+            self.obs[i + self.W].copy_(x)
+
+        if isinstance(reward, torch.Tensor):
+            self.rew[i, 0] = reward.item()
+            self.rew[i + self.W, 0] = reward.item()
+        else:
+            self.rew[i, 0] = float(reward)
+            self.rew[i + self.W, 0] = float(reward)
+
+        self.t += 1
+        self.filled = min(self.filled + 1, self.W)
+
+    def __len__(self):
+        return self.filled
+
+    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          next_obs_window: (L, obs_dim)
+          reward_window:   (L, 1)
+        in chronological order (oldest -> newest), as views (no copy) when L==W.
+        """
+        L = self.filled
+        if L == 0:
+            return self.obs[:0], self.rew[:0]
+
+        if L < self.W:
+            # During warmup, data is in 0..L-1 in chronological order
+            return self.obs[:L], self.rew[:L]
+
+        start = self.t % self.W
+        return self.obs[start:start + self.W], self.rew[start:start + self.W]
+
+    @torch.no_grad()
+    def sample_random_obs(self) -> torch.Tensor:
+        """
+        Sample a random observation from the window.
+
+        Returns:
+          obs: (obs_dim,) tensor
+
+        Raises:
+          ValueError if window is empty
+        """
+        if self.filled == 0:
+            raise ValueError("Cannot sample from empty window")
+
+        # Sample random index from valid range
+        idx = torch.randint(0, self.filled, (1,), device=self.device).item()
+
+        if self.filled < self.W:
+            # During warmup, data is in 0..filled-1
+            return self.obs[idx]
+        else:
+            # After warmup, data wraps around
+            start = self.t % self.W
+            actual_idx = (start + idx) % self.W
+            return self.obs[actual_idx]
+
 
 def load_model(path: str, device: str | None, cls: Any):
     model_dir = Path(path)
@@ -1918,6 +2020,53 @@ def eval(agent, config, t):
             "eval/returns_table": returns_table,
         }, step=t)
 
+# ==================================================
+# Exploration
+# ==================================================
+
+def select_exploratory_z(agent: FBcprAgent, obs: np.ndarray, config: Config) -> torch.Tensor:
+        with torch.no_grad():
+
+            # num_zs x z_dim
+            z = agent._model.sample_z(size=config.expl.num_z_samples, device=agent.device)
+            obs = torch.as_tensor(
+                obs,
+                device=agent.device,
+                dtype=torch.float32
+            ).expand(config.expl.num_z_samples, -1)  # num_zs x obs_dim
+
+            #h = self.encoder(obs)
+            # num_zs x act_dim take the mean, although querying with std 0 anyways
+            acts = agent._model.actor(obs, z, std=1.).mean
+            # ensemble_size x num_zs x z_dim
+            F = agent._model._forward_map(obs, z, acts)
+            # Compute Q values: [ensemble_size, num_zs]
+            Q = (F * z.unsqueeze(0)).sum(dim=-1)
+            Q1, Q2 = Q[0], Q[1]
+
+        if config.expl.f_uncertainty:
+            eF1 = []
+            for i in range(config.expl.num_z_samples):
+                F11 = F[:, i, :].squeeze().to(torch.float64)  # [ensemble_size, z_dim]
+                F11 = F11.transpose(1, 0)  # [z_dim, ensemble_size]
+                cov_F1 = torch.cov(F11)
+                epistemic_F1 = torch.trace(cov_F1)
+                eF1.append(epistemic_F1)
+            # num_zs, naming it for consistency (but its trace of F)
+            epistemic_std1 = torch.tensor(eF1)
+
+        else:
+            epistemic_std1, epistemic_std2 = Q1.std(
+                dim=0), Q2.std(dim=0)  # num_zs
+
+        idxs = torch.argmax(epistemic_std1, dim=0)
+        # take the z with the highest epistemic uncertainty
+        uncertain_z = z[idxs].unsqueeze(0)  # Keep as tensor with shape [1, z_dim]
+        #meta['z'] = uncertain_z
+        #meta['disagr'] = epistemic_std1.std().item()
+        #meta['updated'] = True
+        return uncertain_z
+
 
 if __name__ == "__main__":
 
@@ -1946,9 +2095,38 @@ if __name__ == "__main__":
         seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
     )
 
-    obs_dim, action_dim, discrete = get_env_dims(env)
+    obs_space = env.observation_space
+    action_space = env.action_space
+
+    if hasattr(obs_space, 'shape'):
+        if len(obs_space.shape) == 0:
+            obs_dim = 1
+        else:
+            obs_dim = int(np.prod(obs_space.shape))
+    else:
+        # Fallback: reset and check observation
+        obs, _ = env.reset()
+        obs_dim = int(np.prod(obs.shape))
+
+    if isinstance(action_space, gym.spaces.Discrete) or hasattr(action_space, 'n'):
+        action_dim = int(action_space.n)
+    elif hasattr(action_space, 'shape'):
+        if len(action_space.shape) == 0:
+            action_dim = 1
+        else:
+            action_dim = int(np.prod(action_space.shape))
+    else:
+        # Fallback: sample an action
+        action = action_space.sample()
+        action_dim = int(np.prod(action.shape) if hasattr(action, 'shape') else 1)
+
     config.model.obs_dim = obs_dim
     config.model.action_dim = action_dim
+
+    # Use CPU if CUDA requested but not available (e.g. PyTorch CPU-only build)
+    if config.model.device == "cuda" and not torch.cuda.is_available():
+        config.model.device = "cpu"
+        print("CUDA not available; using device='cpu'")
 
     agent = FBcprAgent(**dataclasses.asdict(config))
 
@@ -1961,12 +2139,39 @@ if __name__ == "__main__":
         ),
     }
 
+    max_buffer_size = config.window_size * config.env.max_episode_steps
+    window = TorchSlidingWindow(
+        window_len=max_buffer_size,
+        obs_dim=obs_dim,
+        device="cpu",
+        obs_dtype=torch.float32,
+    )
+
     cumulative_reward = 0
+    last_returns = deque(maxlen=500)
     expert_rewards = {}
     expert_data = {}
     task_to_id = {task: idx for idx, task in enumerate(task_list)}
 
     for episode in tqdm(range(config.num_episodes)):
+
+
+        # --------------------------------------------------
+        # Best policy selection
+        # --------------------------------------------------
+        if episode < config.warmup_episodes:
+            z = agent._model.sample_z(1, device=agent.device)
+
+        elif np.random.random() < config.expl.epsilon:
+            z = select_exploratory_z(
+                agent,
+                window.sample_random_obs(),
+                config
+            )
+        else:
+            with torch.no_grad(), eval_mode(agent._model):
+                next_obs_tensor, reward_tensor = window.get()
+                z = agent._model.reward_inference(next_obs=next_obs_tensor, reward=reward_tensor)
 
         # --------------------------------------------------
         # Evaluation
@@ -1977,7 +2182,7 @@ if __name__ == "__main__":
         # --------------------------------------------------
         # Train the agent
         # --------------------------------------------------
-        if episode % config.train_freq == 0 and len(replay_buffer["train"]) >= config.train.batch_size: #episode > config.warmup_episodes:
+        if episode % config.train_freq == 0 and episode > config.warmup_episodes:
             metrics = agent.update(replay_buffer, episode)
             if config.use_wandb:
                 wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=episode)
@@ -2010,15 +2215,6 @@ if __name__ == "__main__":
         done_list = []
 
         while not (terminated or truncated):
-            if len(next_obs_list) > 0 and len(reward_list) > 0:
-                # next_obs: (T, obs_dim), reward: (1, T) for reward_inference
-                next_obs_tensor = torch.as_tensor(
-                    np.concatenate(next_obs_list, axis=0), device=agent.device, dtype=torch.float32
-                )
-                reward_tensor = torch.as_tensor(reward_list, device=agent.device, dtype=torch.float32).unsqueeze(1)  # (T, 1) for matmul in reward_inference
-                z = agent._model.reward_inference(next_obs=next_obs_tensor, reward=reward_tensor)
-            else:
-                z = agent._model.sample_z(1, device=agent.device)
 
             action_tensor = agent.act(
                 torch.as_tensor(obs, device=agent.device, dtype=torch.float32).unsqueeze(0),
@@ -2030,6 +2226,8 @@ if __name__ == "__main__":
             next_obs, reward, terminated, truncated, info = env.step(action_env)
 
             episode_reward += reward
+            # TODO: probably nextobs_buffer should contains only last non-exploratory data?
+            window.append(next_obs, reward)
 
             obs_list.append(obs.reshape(1, -1))
             z_list.append(z.cpu().reshape(1, -1))
@@ -2062,6 +2260,7 @@ if __name__ == "__main__":
             expert_data[episode] = episode_dict
 
         cumulative_reward += episode_reward
+        last_returns.append(episode_reward)
 
         # --------------------------------------------------
         # Online metrics

@@ -467,10 +467,16 @@ class HumanoidTaskWrapper(gym.Wrapper):
         obj = self.task_spec["objective"]
         self.obj_type = obj["type"]
 
-        # Pose objective optional
+        # Pose objective: from task spec only (pose = "default" or pose = [qpos list])
         self.pose_target = None
         if self.obj_type == "qpos_pose_distance":
-            self.pose_target = np.load(obj["pose_path"]).astype(np.float64)
+            pose_spec = obj["pose"]
+            if pose_spec == "default":
+                self.pose_target = np.asarray(env.unwrapped.data.qpos.copy(), dtype=np.float64)
+            elif isinstance(pose_spec, (list, tuple)):
+                self.pose_target = np.asarray(pose_spec, dtype=np.float64)
+            else:
+                raise ValueError(f"objective.pose must be 'default' or a list of qpos values, got {type(pose_spec)}")
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)

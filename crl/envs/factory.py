@@ -4,6 +4,7 @@ import itertools
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
 
+# Envs dependencies
 from minigrid.wrappers import FlatObsWrapper
 from minigrid.core.actions import Actions
 
@@ -19,12 +20,18 @@ from metaworld.envs import (
 )
 
 # Environments, adapters and wrappers
-from crl.envs.adapters import MultiTaskGridEnv, DMControlEnv, SimpleDistAsTaskEnv
+from crl.envs.adapters import (
+    MultiTaskGridEnv,
+    DMControlEnv,
+    SimpleDistAsTaskEnv
+)
+
 from crl.envs.tasks import (
     PARKING_DISTS_SPECS,
     PARKING_TASKS_SPECS,
     SYNTHETIC_DISTS_SPECS,
     HUMANOID_TASK_BY_NAME,
+    WALKER2D_TASKS_SPECS,
 )
 from crl.envs.wrappers import (
     ReduceActions,
@@ -42,6 +49,8 @@ from crl.envs.wrappers import (
 from typing import Callable, Dict, Any, Optional
 
 # --- registry of callables returning a fresh env (unwrapped) ---
+# Each @_register("name") stores its function here at import time.
+# The function is only CALLED from make_env() via: env = _REGISTRY[key](**env_kwargs)
 _REGISTRY: Dict[str, Callable[..., gym.Env]] = {}
 
 # --- registry of task sequences ---
@@ -92,8 +101,12 @@ def _multitaskgrid_env(**kwargs) -> gym.Env:
     allowed = [Actions.left, Actions.right, Actions.forward, Actions.pickup]
     env = ReduceActions(env=env, allowed=allowed)
 
-    env = ImageWrapper(env=env)
-    env = FlattenObsWrapper(env=env)
+    # Apply standard wrappers
+    # Use ImageWrapper + flatten instead of FlatObsWrapper to avoid large mission encoding
+    # FlatObsWrapper includes mission one-hot encoding (96*28=2688 dims) which is inefficient
+    # Since mission is not used for rewards, we only need the image
+    env = ImageWrapper(env=env)  # Extract just the image (7, 7, 3)
+    env = FlattenObsWrapper(env=env)  # Flatten to 1D: (147,)
     env = FloatObsWrapper(env=env)
 
     return env
@@ -102,6 +115,9 @@ def _multitaskgrid_env(**kwargs) -> gym.Env:
 @_register("dmcontrol")
 def _dmcontrol_env(**kwargs) -> gym.Env:
     """DeepMind Control Suite environment with configurable domain and task."""
+    # Extract domain and task parameters
+    # Task should be a simple name (e.g., "stand", "walk", "run")
+    # Domain should be provided separately (e.g., "walker")
     task = kwargs.pop('task', None)
     domain = kwargs.pop('domain', None)
 
@@ -209,15 +225,6 @@ def _highway_parking_env(**kwargs) -> gym.Env:
     return env
 
 
-# Gymnasium MuJoCo Walker2d: same dynamics, task = reward config (forward_reward_weight, ctrl_cost_weight, healthy_reward)
-WALKER2D_REWARD_TASKS = {
-    "default": {"forward_reward_weight": 1.0, "ctrl_cost_weight": 1e-3, "healthy_reward": 1.0},
-    "forward_heavy": {"forward_reward_weight": 2.0, "ctrl_cost_weight": 1e-3, "healthy_reward": 0.5},
-    "low_ctrl": {"forward_reward_weight": 1.0, "ctrl_cost_weight": 1e-4, "healthy_reward": 1.0},
-    "survive": {"forward_reward_weight": 0.5, "ctrl_cost_weight": 1e-3, "healthy_reward": 2.0},
-}
-
-
 @_register("mujoco")
 def _mujoco_walker2d_env(**kwargs) -> gym.Env:
     """Gymnasium MuJoCo Walker2d. env_id='mujoco/walker2d', task=reward config (default|forward_heavy|low_ctrl|survive)."""
@@ -226,9 +233,27 @@ def _mujoco_walker2d_env(**kwargs) -> gym.Env:
     if isinstance(task, (list, tuple)):
         task = task[0] if task else "default"
     task = str(task).lower()
-    if task not in WALKER2D_REWARD_TASKS:
-        raise ValueError(f"Unknown task {task!r}. Known: {list(WALKER2D_REWARD_TASKS.keys())}")
-    reward_kwargs = dict(WALKER2D_REWARD_TASKS[task])
+    if task not in WALKER2D_TASKS_SPECS:
+        raise ValueError(f"Unknown task {task!r}. Known: {list(WALKER2D_TASKS_SPECS.keys())}")
+    reward_kwargs = dict(WALKER2D_TASKS_SPECS[task])
+    kwargs.pop("max_episode_steps", None)
+    kwargs.pop("_continual_task_list_len", None)
+    kwargs.pop("seed", None)
+    env = gym.make("Walker2d-v4", **reward_kwargs, **kwargs)
+    return env
+
+
+@_register("mujoco")
+def _mujoco_ant_env(**kwargs) -> gym.Env:
+    """Gymnasium MuJoCo Walker2d. env_id='mujoco/walker2d', task=reward config (default|forward_heavy|low_ctrl|survive)."""
+    env_id = kwargs.pop("env_id", "mujoco/walker2d")
+    task = kwargs.pop("task", "default")
+    if isinstance(task, (list, tuple)):
+        task = task[0] if task else "default"
+    task = str(task).lower()
+    if task not in WALKER2D_TASKS_SPECS:
+        raise ValueError(f"Unknown task {task!r}. Known: {list(WALKER2D_TASKS_SPECS.keys())}")
+    reward_kwargs = dict(WALKER2D_TASKS_SPECS[task])
     kwargs.pop("max_episode_steps", None)
     kwargs.pop("_continual_task_list_len", None)
     kwargs.pop("seed", None)
@@ -301,6 +326,10 @@ _HUMANOID_TASK_NAMES = list(HUMANOID_TASK_BY_NAME.keys())
 _register_task_sequence("mujoco/humanoid", "basic", ["stand", "walk_forward", "run_forward", "crouch"])
 _register_task_sequence("mujoco/humanoid", "full", _HUMANOID_TASK_NAMES)
 
+# COOM (Continual DOOM) official sequences: task_list is sequence name (CO8, CD8, ...)
+for _seq in ["CO8", "CD8", "CO4", "CD4", "CO16", "CD16", "COC", "MIXED"]:
+    _register_task_sequence("coom", _seq.lower(), [_seq])
+
 # ============================================
 # Exposed public methods
 # ============================================
@@ -346,11 +375,20 @@ def make_env(
         env_kwargs["env_id"] = env_id
         key = "mujoco"
 
-    if key not in _REGISTRY:
-        known = ", ".join(sorted(_REGISTRY.keys()))
-        raise ValueError(f"Unknown env_id '{env_id}'. Known: {known}")
-
-    env = _REGISTRY[key](**env_kwargs)
+    if key in _REGISTRY:
+        env = _REGISTRY[key](**env_kwargs)
+    else:
+        # Single-task Gymnasium envs (CartPole-v1, Ant-v5, etc.)
+        # MuJoCo v2/v3 moved to gymnasium-robotics; v5 envs are in gymnasium (use mujoco pkg)
+        #fallback_kw = {k: v for k, v in env_kwargs.items() if k not in ("domain", "env_id")}
+        try:
+            env = gym.make(env_id)
+        except ImportError as e:
+            if "gymnasium-robotics" in str(e) and ("v4" in env_id or "v3" in env_id or "v2" in env_id):
+                env_id_v5 = env_id.rsplit("-", 1)[0] + "-v5"
+                env = gym.make(env_id_v5)
+            else:
+                raise
 
     # Consistent seeding
     if seed is not None:
@@ -462,6 +500,29 @@ def make_continual_episodic_env(
     # Resolve task_list if it's a string (task sequence name)
     if isinstance(task_list, str):
         task_list = get_task_sequence(env_id, task_list)
+
+    # COOM: official benchmark with fixed steps per task (no ContinualEpisodicWrapper)
+    if env_id.lower() == "coom":
+        try:
+            from COOM.env.continual import ContinualLearningEnv
+            from COOM.utils.config import Sequence as COOMSequence
+        except ImportError as e:
+            raise ImportError("COOM required for env_id='coom'. pip install COOM") from e
+        seq_name = task_list[0].upper()
+        seq_enum = getattr(COOMSequence, seq_name, None)
+        if seq_enum is None:
+            raise ValueError(f"Unknown COOM sequence {task_list[0]!r}. Use e.g. CO8, CD8, CO4, CD4, CO16, CD16, COC, MIXED.")
+        steps_per_env = env_kwargs.pop("steps_per_env", 200_000)
+        env = ContinualLearningEnv(sequence=seq_enum, steps_per_env=steps_per_env)
+        if seed is not None:
+            try:
+                env.reset(seed=seed)
+            except Exception:
+                pass
+        if wrappers:
+            for w in wrappers:
+                env = w(env)
+        return env
 
     # Kwargs for the single env: only what make_env needs (no task_list).
     # _continual_task_list_len is used by metaworld to build the right number of tasks.

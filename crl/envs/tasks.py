@@ -378,7 +378,7 @@ HUMANOID_TASKS_SPECS = {
       },
       "objective": {
         "type": "qpos_pose_distance",
-        "pose_path": "poses/standing.npy",
+        "pose": "default",
         "mask": {
           "exclude_root_xy": True,
           "exclude_root_quat": False
@@ -406,3 +406,30 @@ HUMANOID_TASKS_SPECS = {
 
 # Lookup by task name for factory and CLI
 HUMANOID_TASK_BY_NAME = {t["name"]: t for t in HUMANOID_TASKS_SPECS["tasks"]}
+
+
+# ==========================================================================================
+# Walker2d-v4 task specifications
+# ==========================================================================================
+WALKER2D_TASKS_SPECS = {
+    "default": {
+        "forward_reward_weight": 1.0,
+        "ctrl_cost_weight": 1e-3,
+        "healthy_reward": 1.0
+    },
+    "forward_heavy": {
+        "forward_reward_weight": 2.0,
+        "ctrl_cost_weight": 1e-3,
+        "healthy_reward": 0.5
+    },
+    "low_ctrl": {
+      "forward_reward_weight": 1.0,
+      "ctrl_cost_weight": 1e-4,
+      "healthy_reward": 1.0
+    },
+    "survive": {
+      "forward_reward_weight": 0.5,
+      "ctrl_cost_weight": 1e-3,
+      "healthy_reward": 2.0
+    },
+}
