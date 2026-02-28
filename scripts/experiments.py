@@ -21,10 +21,10 @@ if __name__ == "__main__":
         common_args = [
             "--env.domain_name=highway_parking",
             f"--env.task_list={task_list}",
-            "--env.task_switch_prob=0.01",
+            "--env.steps_per_task=200000",
             "--env.max_episode_steps=1000",
             "--env.seed=0",
-            "--num_episodes=10000",
+            "--num_steps=0",
             #"--no-use-wandb",
         ]
 

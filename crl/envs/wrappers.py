@@ -1,7 +1,7 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from typing import List, Optional, Callable, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import metaworld
 from metaworld.sawyer_xyz_env import SawyerXYZEnv
@@ -125,79 +125,76 @@ class ChannelStandardizationWrapper(gym.ObservationWrapper):
                 return obs[:, :, :self.target_channels].astype(np.float32)
 
 
-class ContinualEpisodicWrapper(gym.Wrapper):
+class BraxTaskTransformWrapper(gym.Env):
     """
-    Continual episodic setting: fixed episode length, random task at each reset
-    with given switch probability. Manages task switching and truncation.
+    Applies per-task action transforms (mask/inversion) and annotates task info.
+    This wrapper is task-static: one wrapped env instance corresponds to one task.
+
+    Inherits from gymnasium.Env (not gymnasium.Wrapper) so it can wrap the old-gym
+    brax TorchWrapper without triggering gymnasium's isinstance assertion.
+    Always exposes a gymnasium-compatible interface on the outside.
     """
 
-    def __init__(
-        self,
-        env: gym.Env,
-        task_list: List[str],
-        max_episode_steps: int,
-        env_factory: Optional[Callable[[str], gym.Env]] = None,
-        task_switch_prob: float = 1.0,
-        seed: Optional[int] = None,
-    ):
-        super().__init__(env)
-        if not task_list:
-            raise ValueError("task_list must contain at least one task")
-        if not 0.0 <= task_switch_prob <= 1.0:
-            raise ValueError(f"task_switch_prob must be in [0.0, 1.0], got {task_switch_prob}")
+    def __init__(self, env, task_name: str, task_spec: Optional[Dict[str, Any]] = None):
+        super().__init__()
+        self.env = env
+        self.action_space = env.action_space
+        self.observation_space = env.observation_space
+        self.task_name = str(task_name)
+        self.task_spec = dict(task_spec or {})
+        self._action_coefficient = float(self.task_spec.get("action_coefficient", 1.0))
+        self._action_mask = self.task_spec.get("action_mask")
+        if self._action_mask is not None:
+            self._action_mask = np.asarray(self._action_mask, dtype=np.float32)
 
-        self.task_list = list(task_list)
-        self.max_episode_steps = max_episode_steps
-        self.env_factory = env_factory
-        self.task_switch_prob = task_switch_prob
-        self.rng = np.random.RandomState(seed)
-        self.episode_timesteps = 0
-        self.current_task = None
+    def _transform_action(self, action):
+        try:
+            import torch
+            is_torch = isinstance(action, torch.Tensor)
+        except ImportError:
+            is_torch = False
+
+        a = np.asarray(action.detach().cpu() if is_torch else action, dtype=np.float32)
+        if self._action_mask is not None:
+            a = a * self._action_mask
+        a = self._action_coefficient * a
+        if isinstance(self.action_space, spaces.Box):
+            a = np.clip(a, self.action_space.low, self.action_space.high)
+
+        if is_torch:
+            return torch.tensor(a, dtype=torch.float32)
+        return a
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        if self.current_task is None or self.rng.random() < self.task_switch_prob:
-            self.current_task = self.rng.choice(self.task_list)
-
-        if self.env_factory is not None:
-            old_env = self.env
-            self.env = self.env_factory(self.current_task)
-            if hasattr(old_env, "close"):
-                old_env.close()
+        # brax GymWrapper exposes seed() + no-arg reset; gymnasium uses reset(seed=...)
+        if seed is not None and hasattr(self.env, "seed"):
+            self.env.seed(seed)
+            result = self.env.reset()
         else:
-            if hasattr(self.env, "set_task"):
-                self.env.set_task(self.current_task)
-            elif hasattr(self.env, "task"):
-                self.env.task = self.current_task
+            try:
+                result = self.env.reset(seed=seed, options=options)
+            except TypeError:
+                result = self.env.reset()
 
-        obs, info = self.env.reset(seed=seed, options=options)
-        self.episode_timesteps = 0
-        info = info or {}
-        info["task"] = self.current_task
-        info["max_episode_steps"] = self.max_episode_steps
+        obs, info = (result if isinstance(result, tuple) else (result, {}))
+        info = dict(info or {})
+        info["task"] = self.task_name
         return obs, info
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self.episode_timesteps += 1
-        if self.episode_timesteps >= self.max_episode_steps:
-            truncated = True
-        info = info or {}
-        info["task"] = self.current_task
-        info["episode_timestep"] = self.episode_timesteps
+        result = self.env.step(self._transform_action(action))
+        if len(result) == 4:
+            obs, reward, done, info = result
+            terminated, truncated = bool(done), False
+        else:
+            obs, reward, terminated, truncated, info = result
+        info = dict(info or {})
+        info["task"] = self.task_name
         return obs, reward, terminated, truncated, info
 
-    def get_task_id(self) -> int:
-        """Index of current task in task_list, or -1 if not set."""
-        if self.current_task is None:
-            return -1
-        try:
-            return self.task_list.index(self.current_task)
-        except ValueError:
-            return -1
-
-    def get_task_name(self) -> str:
-        """Current task id string, or 'unknown' if not set."""
-        return self.current_task if self.current_task is not None else "unknown"
+    def close(self):
+        if hasattr(self.env, "close"):
+            self.env.close()
 
 
 class HighwayParkingDistWrapper(gym.Wrapper):
@@ -231,7 +228,10 @@ class HighwayParkingDistWrapper(gym.Wrapper):
 
     def set_task(self, task: str) -> None:
         if task not in self.dists_spec and task not in self.tasks_spec:
-            raise ValueError(f"Unknown task '{task}'. Known dists: {list(self.dists_spec)}; tasks: {list(self.tasks_spec)}")
+            raise ValueError(
+                f"Unknown task '{task}'. Known dists: {list(self.dists_spec)}; "
+                f"tasks: {list(self.tasks_spec)}"
+            )
         self._task_id = task
 
     def _sample_config(self) -> Dict[str, Any]:
@@ -418,158 +418,62 @@ class MetaworldTaskSwitcher(gym.Wrapper):
 
         return obs, info
 
-# ==========================================================================================
-# Humanoid task wrapper
-# ==========================================================================================
 
-import json
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-from crl.envs.tasks import HUMANOID_TASKS_SPECS
-import gymnasium as gym
-import numpy as np
+# ==================================================
+# MJX (mujoco_playground) gymnasium adapter
+# ==================================================
 
+class MjxGymnasiumWrapper(gym.Env):
+    """Wraps a mujoco_playground MjxEnv with a standard gymnasium interface.
 
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r") as f:
-        return json.load(f)
+    MjxEnv API (pure JAX, stateful):
+        state = env.reset(rng: jax.Array)
+        state = env.step(state, action: jax.Array)
 
-
-def compute_com_xy(env) -> np.ndarray:
-    # MuJoCo: center of mass of subtree rooted at torso usually works.
-    # This is a simple, robust proxy: use torso body COM position.
-    # If torso name differs, adjust once after printing body names.
-    m = env.unwrapped.model
-    d = env.unwrapped.data
-    torso_id = m.body("torso").id if hasattr(m, "body") else 1
-    return np.array(d.xipos[torso_id, :2], dtype=np.float64)
-
-
-@dataclass
-class TaskState:
-    prev_com_xy: Optional[np.ndarray] = None
-    min_pose_dist: float = float("inf")
-
-
-class HumanoidTaskWrapper(gym.Wrapper):
+    This wrapper stores the JAX state internally, JIT-compiles reset/step on
+    first call, and converts observations/actions between numpy and JAX.
     """
-    Adds an auxiliary task reward r_task to the environment reward, and logs metrics in info.
-    Set add_to_reward=False to log only (evaluation mode).
-    """
-    def __init__(self, env: gym.Env, task_spec: Dict[str, Any], add_to_reward: bool = True):
-        super().__init__(env)
-        self.task_spec = task_spec
-        self.add_to_reward = add_to_reward
-        self.state = TaskState()
 
-        self.dt = float(getattr(env.unwrapped, "dt", 0.01))  # fallback
+    def __init__(self, mjx_env, seed: int = 0, max_episode_steps: int = 1000):
+        import jax
+        super().__init__()
+        self._env = mjx_env
+        self._max_episode_steps = max_episode_steps
+        self._step_count = 0
+        self._state = None
+        self._key = jax.random.PRNGKey(seed)
 
-        obj = self.task_spec["objective"]
-        self.obj_type = obj["type"]
+        # JIT-compile for speed (first call triggers compilation)
+        self._jit_reset = jax.jit(mjx_env.reset)
+        self._jit_step  = jax.jit(mjx_env.step)
 
-        # Pose objective: from task spec only (pose = "default" or pose = [qpos list])
-        self.pose_target = None
-        if self.obj_type == "qpos_pose_distance":
-            pose_spec = obj["pose"]
-            if pose_spec == "default":
-                self.pose_target = np.asarray(env.unwrapped.data.qpos.copy(), dtype=np.float64)
-            elif isinstance(pose_spec, (list, tuple)):
-                self.pose_target = np.asarray(pose_spec, dtype=np.float64)
-            else:
-                raise ValueError(f"objective.pose must be 'default' or a list of qpos values, got {type(pose_spec)}")
+        action_size = mjx_env.action_size
+        obs_size    = mjx_env.observation_size
+        self.action_space      = spaces.Box(-1.0, 1.0, shape=(action_size,),  dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_size,), dtype=np.float32)
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self.state = TaskState()
-        self.state.prev_com_xy = compute_com_xy(self.env)
-        info = dict(info)
-        info.update({"task_name": self.task_spec["name"]})
-        return obs, info
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
+        import jax
+        if seed is not None:
+            self._key = jax.random.PRNGKey(seed)
+        self._key, rng = jax.random.split(self._key)
+        self._state = self._jit_reset(rng)
+        self._step_count = 0
+        obs = np.asarray(self._state.obs, dtype=np.float32)
+        return obs, {}
 
-    def step(self, action):
-        obs, r_env, terminated, truncated, info = self.env.step(action)
-        info = dict(info)
+    def step(self, action) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        import jax.numpy as jnp
+        action_jax = jnp.asarray(action, dtype=jnp.float32)
+        self._state = self._jit_step(self._state, action_jax)
+        obs        = np.asarray(self._state.obs,    dtype=np.float32)
+        reward     = float(self._state.reward)
+        terminated = bool(self._state.done)
+        self._step_count += 1
+        truncated  = self._step_count >= self._max_episode_steps
+        info       = {k: float(v) for k, v in self._state.metrics.items()}
+        return obs, reward, terminated, truncated, info
 
-        # signals
-        com_xy = compute_com_xy(self.env)
-        v_xy = (com_xy - self.state.prev_com_xy) / self.dt
-        self.state.prev_com_xy = com_xy
+    def close(self):
+        pass
 
-        qpos = np.asarray(self.env.unwrapped.data.qpos, dtype=np.float64)
-        qvel = np.asarray(self.env.unwrapped.data.qvel, dtype=np.float64)
-        height = float(qpos[2])
-
-        r_task, task_metrics = self._task_reward_and_metrics(v_xy, height, qpos, qvel, action)
-        info.update(task_metrics)
-
-        r_total = float(r_env + r_task) if self.add_to_reward else float(r_env)
-        return obs, r_total, terminated, truncated, info
-
-    def _task_reward_and_metrics(
-        self,
-        v_xy: np.ndarray,
-        height: float,
-        qpos: np.ndarray,
-        qvel: np.ndarray,
-        action: np.ndarray
-    ) -> Tuple[float, Dict[str, Any]]:
-        obj = self.task_spec["objective"]
-        w = obj.get("weights", {})
-
-        if obj["type"] == "velocity_tracking":
-            tx, ty = float(obj["target_x_velocity"]), float(obj["target_y_velocity"])
-            sigma = float(obj["sigma_v"])
-            err2 = (v_xy[0] - tx) ** 2 + (v_xy[1] - ty) ** 2
-            r = float(w.get("w_vel", 1.0) * np.exp(-err2 / (2.0 * sigma * sigma)))
-            return r, {"task_vx": float(v_xy[0]), "task_vy": float(v_xy[1]), "task_err2": float(err2)}
-
-        if obj["type"] == "height_tracking":
-            th = float(obj["target_height"])
-            sigma = float(obj["sigma_h"])
-            err2 = (height - th) ** 2
-            r = float(w.get("w_height", 1.0) * np.exp(-err2 / (2.0 * sigma * sigma)))
-            return r, {"task_h": float(height), "task_err2": float(err2)}
-
-        if obj["type"] == "velocity_height_tracking":
-            tx, ty = float(obj["target_x_velocity"]), float(obj["target_y_velocity"])
-            sv = float(obj["sigma_v"])
-            th = float(obj["target_height"])
-            sh = float(obj["sigma_h"])
-
-            err_v2 = (v_xy[0] - tx) ** 2 + (v_xy[1] - ty) ** 2
-            err_h2 = (height - th) ** 2
-            r = float(
-                w.get("w_vel", 1.0) * np.exp(-err_v2 / (2.0 * sv * sv))
-                + w.get("w_height", 1.0) * np.exp(-err_h2 / (2.0 * sh * sh))
-            )
-            return r, {
-                "task_vx": float(v_xy[0]),
-                "task_vy": float(v_xy[1]),
-                "task_h": float(height),
-                "task_err_v2": float(err_v2),
-                "task_err_h2": float(err_h2),
-            }
-
-        if obj["type"] == "qpos_pose_distance":
-            # mask: exclude root x/y
-            nq = qpos.shape[0]
-            mask = np.ones(nq, dtype=bool)
-            if obj.get("mask", {}).get("exclude_root_xy", True):
-                mask[0] = False
-                mask[1] = False
-
-            weights_mode = obj.get("weights", {}).get("mode", "uniform")
-            weights = np.ones(nq, dtype=np.float64)
-            if weights_mode == "uniform":
-                weights[:] = 1.0
-            # If you want joint-group weights, add them here after introspecting joint names.
-
-            diff = (qpos - self.pose_target)
-            dist = float(np.sqrt(np.sum(weights[mask] * diff[mask] * diff[mask])))
-            self.state.min_pose_dist = min(self.state.min_pose_dist, dist)
-
-            thr = float(obj.get("distance", {}).get("success_threshold", 0.7))
-            r = float(np.exp(-(dist * dist) / (2.0 * (thr * thr))))
-            return r, {"task_pose_dist": dist, "task_pose_min_dist": self.state.min_pose_dist, "task_success": self.state.min_pose_dist < thr}
-
-        raise ValueError(f"Unknown objective type: {obj['type']}")

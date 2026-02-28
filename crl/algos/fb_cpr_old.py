@@ -26,7 +26,7 @@ from collections import deque
 from collections.abc import Mapping
 
 from crl.buffers import DictBuffer, ZBuffer, TrajectoryBuffer
-from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence
+from crl.envs import EnvConfig, make_env, get_task_sequence
 
 print("cuda available:", torch.cuda.is_available())
 print("device count:", torch.cuda.device_count())
@@ -2087,12 +2087,11 @@ if __name__ == "__main__":
 
     print(f"task list on main: {task_list}")
 
-    env = make_continual_episodic_env(
+    env = make_env(
         env_id=config.env.domain_name,
-        task_list=task_list,
+        task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        task_switch_prob=config.env.task_switch_prob,
-        seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
+        seed=config.env.seed,
     )
 
     obs_space = env.observation_space

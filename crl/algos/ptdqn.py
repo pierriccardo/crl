@@ -25,7 +25,7 @@ from dataclasses import dataclass, asdict
 from tqdm import tqdm
 
 from crl.buffers import ReplayBuffer
-from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence
+from crl.envs import EnvConfig, make_env, get_task_sequence
 
 
 # ==============================
@@ -42,7 +42,7 @@ class Config:
     env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
 
     # Training parameters
-    num_episodes: int = 10**4  # training episodes
+    num_steps: int = 0  # total train steps (0 => len(task_list)*env.steps_per_task)
     buffer_size: int = 100_000
 
     # Dual-timescale specific parameters
@@ -65,11 +65,11 @@ class Config:
     target_update_freq: int = 1000
     tau: float = 1.0  # Hard update coefficient for target network
     batch_size: int = 128
-    train_freq: int = 1  # Train every N episodes
-    warmup_episodes: int = 10  # Episodes before training starts
+    train_freq_steps: int = 1  # Train every N environment steps
+    warmup_steps: int = 1000  # Steps before training starts
 
     # Evaluation
-    eval_freq: int = 100  # episodes
+    eval_freq_steps: int = 10000
     do_eval: bool = True
     num_eval_episodes: int = 5
 
@@ -423,11 +423,10 @@ if __name__ == "__main__":
 
     print(f"Task list: {task_list}")
 
-    env = make_continual_episodic_env(
+    env = make_env(
         env_id=config.env.domain_name,
-        task_list=task_list,
+        task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        task_switch_prob=config.env.task_switch_prob,
         seed=config.env.seed,
     )
 
@@ -448,68 +447,67 @@ if __name__ == "__main__":
         device=config.device
     )
 
-    cumulative_reward = 0
-    episode_rewards = []
+    cumulative_reward = 0.0
+    steps_per_task = max(1, int(config.env.steps_per_task))
+    total_steps = int(config.num_steps) if config.num_steps > 0 else len(task_list) * steps_per_task
+    global_step = 0
 
-    if isinstance(config.env.task_list, str):
-        task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
-    else:
-        task_list = config.env.task_list
-    task_to_id = {task: idx for idx, task in enumerate(task_list)}
-
-    for episode in tqdm(range(config.num_episodes)):
-        # --------------------------------------------------
-        # Evaluation
-        # --------------------------------------------------
-        if episode % config.eval_freq == 0 and episode > 0:
-            print(f"\n[Episode {episode}] Running evaluation on all tasks...")
-            evaluate_all_tasks(agent, config, episode)
-
-        # --------------------------------------------------
-        # Train the agent
-        # --------------------------------------------------
-        if episode % config.train_freq == 0 and len(replay_buffer) >= config.batch_size and episode >= config.warmup_episodes:
-            metrics = agent.update(replay_buffer)
-
-            if metrics is not None and config.use_wandb:
-                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=episode)
-
-        # --------------------------------------------------
-        # Online env interaction
-        # --------------------------------------------------
-        state, info = env.reset()
-        # Extract current task for logging
-        current_task = info.get('task', 'unknown') if info else 'unknown'
-        current_task_id = task_to_id.get(current_task, -1)
-
-        terminated = truncated = False
+    for task_idx, task_name in enumerate(task_list):
+        if global_step >= total_steps:
+            break
+        env.close()
+        env = make_env(
+            env_id=config.env.domain_name,
+            task=task_name,
+            max_episode_steps=config.env.max_episode_steps,
+            seed=config.env.seed,
+        )
+        task_steps = 0
+        state, _ = env.reset()
         episode_reward = 0.0
         episode_steps = 0
 
-        while not (terminated or truncated):
-            # Select action
-            action = agent.act(state, training=True)
+        while task_steps < steps_per_task and global_step < total_steps:
+            if global_step > 0 and global_step % config.eval_freq_steps == 0:
+                print(f"\n[Step {global_step}] Running evaluation on all tasks...")
+                evaluate_all_tasks(agent, config, global_step)
 
-            next_state, reward, terminated, truncated, info = env.step(action)
+            if (
+                global_step % config.train_freq_steps == 0
+                and len(replay_buffer) >= config.batch_size
+                and global_step >= config.warmup_steps
+            ):
+                metrics = agent.update(replay_buffer)
+                if metrics is not None and config.use_wandb:
+                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
+
+            action = agent.act(state, training=True)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            episode_steps += 1
+            if episode_steps >= config.env.max_episode_steps:
+                truncated = True
             replay_buffer.add(state, next_state, action, reward, terminated, truncated)
 
             episode_reward += reward
-            episode_steps += 1
+            cumulative_reward += reward
             state = next_state
+            global_step += 1
+            task_steps += 1
 
-        cumulative_reward += episode_reward
-        episode_rewards.append(episode_reward)
-
-        # --------------------------------------------------
-        # Online metrics
-        # --------------------------------------------------
-        if config.use_wandb:
-            wandb.log({
-                "metrics/cumulative_reward": cumulative_reward,
-                "metrics/log_cumulative_reward": np.log(cumulative_reward),
-                "metrics/reward_per_episode": episode_reward,
-                "metrics/task_id": current_task_id,
-            }, step=episode)
+            if terminated or truncated:
+                if config.use_wandb:
+                    wandb.log(
+                        {
+                            "metrics/cumulative_reward": cumulative_reward,
+                            "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward)),
+                            "metrics/reward_per_episode": episode_reward,
+                            "metrics/task_id": task_idx,
+                        },
+                        step=global_step,
+                    )
+                state, _ = env.reset()
+                episode_reward = 0.0
+                episode_steps = 0
 
 
 

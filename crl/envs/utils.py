@@ -3,14 +3,15 @@ from dataclasses import dataclass
 
 from typing import Tuple
 
+
 @dataclass
 class EnvConfig:
-    domain_name: str = "dmc/walker"
-    task: str = "default" # only used if env has multiple tasks
-    task_list: str = "default"
+    domain_name: str = "mjx/cheetah"
+    task: str = "default"  # only used if env has multiple tasks
+    task_list: str = "transfer"
     seed: int = 0
     max_episode_steps: int = 1000
-    task_switch_prob: float = .01  # Probability of switching task at each episode reset (1.0 = always switch)
+    steps_per_task: int = 200_000  # stage-wise interaction budget per task
 
 
 def get_env_dims(env: gym.Env) -> Tuple[int, int, bool]:

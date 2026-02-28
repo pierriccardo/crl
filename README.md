@@ -1,6 +1,6 @@
 # Continual Reinforcement Learning
 
-Experiments with continual reinforcement learning: multiple tasks in sequence, with optional task switching and step-based or episodic regimes.
+Experiments with continual reinforcement learning: fixed task sequences trained with step budgets per task.
 
 ## Installation
 
@@ -33,17 +33,28 @@ python crl/algos/fb_cpr.py --help
 ## Environments
 
 - **Single task:** `make_env(env_id, task=...)`
-- **Continual (episodic):** `make_continual_episodic_env(env_id, task_list, ...)` — fixed-length episodes with optional task switching each reset.
+- **Continual sequence:** resolve tasks with `get_task_sequence(...)` and iterate over tasks in the training loop.
 
 Helpers: `list_envs()`, `get_task_sequence(env_name, sequence_name)`, `list_task_sequences(env_name)`.
 
-Registered envs include: `minigrid`, `switchingdist`, `dmc/*`, `highway_parking`, `metaworld/*`, `mujoco/walker2d`, `mujoco/humanoid`, `coom`. Add or extend envs and sequences in `crl/envs/factory.py`.
+Registered envs include: `minigrid`, `switchingdist`, `dmc/*`, `highway_parking`, `metaworld/*`, `mujoco/walker2d`, `mujoco/humanoid`, `brax/*`, `coom`. Add or extend envs and sequences in `crl/envs/factory.py`.
 
 Example:
 ```python
-from crl.envs import make_continual_episodic_env, get_task_sequence
+from crl.envs import make_env, get_task_sequence
 
-env = make_continual_episodic_env("highway_parking", "tasks_basic", max_episode_steps=500)
+tasks = get_task_sequence("highway_parking", "tasks_basic")
+env = make_env("highway_parking", task=tasks[0], max_episode_steps=500)
+```
+
+Brax continual example (paper-style scenarios):
+```bash
+python crl/algos/fb_cpr.py \
+  --env.domain_name=brax/halfcheetah \
+  --env.task_list=compositionality \
+  --env.steps_per_task=200000 \
+  --env.max_episode_steps=1000 \
+  --do_eval
 ```
 
 ## Results and plotting

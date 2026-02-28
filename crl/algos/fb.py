@@ -12,7 +12,6 @@ import gymnasium as gym
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch import autograd
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
 
@@ -21,12 +20,11 @@ import safetensors.torch
 from safetensors.torch import save_model as safetensors_save_model
 
 from tqdm import tqdm
-from typing import Any, Dict, Tuple, List, Optional, Callable
-from collections import deque
+from typing import Any, Dict, Tuple
 from collections.abc import Mapping
 
-from crl.buffers import DictBuffer, ZBuffer, TrajectoryBuffer
-from crl.envs import EnvConfig, make_continual_episodic_env, make_env, get_task_sequence
+from crl.buffers import DictBuffer, ZBuffer
+from crl.envs import EnvConfig, make_env, get_task_sequence
 
 print("cuda available:", torch.cuda.is_available())
 print("device count:", torch.cuda.device_count())
@@ -135,20 +133,20 @@ class Config:
     env: EnvConfig = dataclasses.field(default_factory=EnvConfig)
 
     seed: int = 0
-    num_episodes: int = 10**4
+    num_steps: int = 0  # total train steps (0 => len(task_list)*env.steps_per_task)
     buffer_size: int = 100_000
     expert_buffer_size: int = 1000
     expert_buffer_max: int = 100  # Keep only top N episodes by reward on the expert
     window_size: int = 15  # Inference sliding window
-    expl: ExplorationConfig = dataclasses.field(default_factory=ExplorationConfig)
-    warmup_episodes: int = 20
 
-    train_freq: int = 1  # episodes
+    warmup_steps: int = 20_000
+
+    train_freq_steps: int = 1
     num_inference_samples: int = 5000
     temperature: float = 0.1 # Temp for discrete action policy
 
     # eval
-    eval_freq: int = 100  # episodes
+    eval_freq_steps: int = 20_000
     do_eval: bool = True
     num_eval_episodes: int = 5
 
@@ -1638,12 +1636,11 @@ if __name__ == "__main__":
 
     print(f"task list on main: {task_list}")
 
-    env = make_continual_episodic_env(
+    env = make_env(
         env_id=config.env.domain_name,
-        task_list=task_list,
+        task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        task_switch_prob=config.env.task_switch_prob,
-        seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
+        seed=config.env.seed,  # keep env seed fixed, change only algo seed
     )
 
     obs_space = env.observation_space
@@ -1688,111 +1685,106 @@ if __name__ == "__main__":
         obs_dtype=torch.float32,
     )
 
-    cumulative_reward = 0
-    task_to_id = {task: idx for idx, task in enumerate(task_list)}
+    cumulative_reward = 0.0
+    steps_per_task = max(1, int(config.env.steps_per_task))
+    total_steps = int(config.num_steps) if config.num_steps > 0 else len(task_list) * steps_per_task
+    global_step = 0
 
-    for episode in tqdm(range(config.num_episodes)):
+    for task_idx, current_task in enumerate(task_list):
+        if global_step >= total_steps:
+            break
+        env.close()
+        env = make_env(
+            env_id=config.env.domain_name,
+            task=current_task,
+            max_episode_steps=config.env.max_episode_steps,
+            seed=config.env.seed,
+        )
+        task_steps = 0
 
+        while task_steps < steps_per_task and global_step < total_steps:
+            if global_step < config.warmup_steps:
+                z = agent._model.sample_z(1, device=agent.device)
+            elif np.random.random() < config.expl.epsilon:
+                z = select_exploratory_z(agent, window.sample_random_obs(), config)
+            else:
+                with torch.no_grad(), eval_mode(agent._model):
+                    next_obs_tensor, reward_tensor = window.get()
+                    z = agent._model.reward_inference(next_obs=next_obs_tensor, reward=reward_tensor)
 
-        # --------------------------------------------------
-        # Best policy selection
-        # --------------------------------------------------
-        if episode < config.warmup_episodes:
-            z = agent._model.sample_z(1, device=agent.device)
+            if config.do_eval and global_step > 0 and global_step % config.eval_freq_steps == 0:
+                eval(agent, config, global_step)
 
-        elif np.random.random() < config.expl.epsilon:
-            z = select_exploratory_z(
-                agent,
-                window.sample_random_obs(),
-                config
-            )
-        else:
-            with torch.no_grad(), eval_mode(agent._model):
-                next_obs_tensor, reward_tensor = window.get()
-                z = agent._model.reward_inference(next_obs=next_obs_tensor, reward=reward_tensor)
+            if global_step % config.train_freq_steps == 0 and global_step >= config.warmup_steps:
+                metrics = agent.update(replay_buffer, global_step)
+                if config.use_wandb:
+                    wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
 
-        # --------------------------------------------------
-        # Evaluation
-        # --------------------------------------------------
-        if config.do_eval and episode % config.eval_freq == 0:
-            eval(agent, config, episode)
+            obs, _ = env.reset()
+            terminated = truncated = False
+            episode_reward = 0.0
+            episode_steps = 0
 
-        # --------------------------------------------------
-        # Train the agent
-        # --------------------------------------------------
-        if episode % config.train_freq == 0 and episode > config.warmup_episodes:
-            metrics = agent.update(replay_buffer, episode)
+            obs_list = []
+            z_list = []
+            action_list = []
+            reward_list = []
+            next_obs_list = []
+            done_list = []
+
+            while (
+                not (terminated or truncated)
+                and task_steps < steps_per_task
+                and global_step < total_steps
+            ):
+                action_tensor = agent.act(
+                    torch.as_tensor(obs, device=agent.device, dtype=torch.float32).unsqueeze(0),
+                    z,
+                    mean=False,
+                )
+                action = action_tensor.cpu().numpy()[0]
+                action_env = discretize_action_for_env(action, env.action_space, temperature=config.temperature)
+                next_obs, reward, terminated, truncated, _ = env.step(action_env)
+                episode_steps += 1
+                if episode_steps >= config.env.max_episode_steps:
+                    truncated = True
+
+                episode_reward += reward
+                cumulative_reward += reward
+                window.append(next_obs, reward)
+                global_step += 1
+                task_steps += 1
+
+                obs_list.append(obs.reshape(1, -1))
+                z_list.append(z.cpu().reshape(1, -1))
+                action_list.append(action.reshape(1, -1))
+                next_obs_list.append(next_obs.reshape(1, -1))
+                done_list.append(terminated)
+                reward_list.append(reward)
+                obs = next_obs
+
+            T = len(obs_list)
+            if T == 0:
+                continue
+            episode_dict = {
+                "observation": np.concatenate(obs_list, axis=0).astype(np.float32),
+                "action": np.concatenate(action_list, axis=0).astype(np.float32),
+                "z": np.concatenate(z_list, axis=0).astype(np.float32),
+                "reward": np.asarray(reward_list, dtype=np.float32).reshape(T, 1),
+                "next": {
+                    "observation": np.concatenate(next_obs_list, axis=0).astype(np.float32),
+                    "terminated": np.asarray(done_list, dtype=np.bool_).reshape(T, 1),
+                },
+            }
+            replay_buffer["train"].extend(episode_dict)
+
             if config.use_wandb:
-                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=episode)
-
-        # --------------------------------------------------
-        # Online env interaction
-        # --------------------------------------------------
-        obs, info = env.reset()
-        # Extract current task for logging
-        current_task = info.get('task', 'unknown') if info else 'unknown'
-        current_task_id = task_to_id.get(current_task, -1)
-
-        terminated = truncated = False
-        episode_reward = 0.0
-
-        obs_list = []
-        z_list = []
-        action_list = []
-        reward_list = []
-        next_obs_list = []
-        done_list = []
-
-        while not (terminated or truncated):
-
-            action_tensor = agent.act(
-                torch.as_tensor(obs, device=agent.device, dtype=torch.float32).unsqueeze(0),
-                z,
-                mean=False
-            )
-            action = action_tensor.cpu().numpy()[0]  # [1, action_dim] -> [action_dim]
-            action_env = discretize_action_for_env(action, env.action_space, temperature=config.temperature)
-            next_obs, reward, terminated, truncated, info = env.step(action_env)
-
-            episode_reward += reward
-            # TODO: probably nextobs_buffer should contains only last non-exploratory data?
-            window.append(next_obs, reward)
-
-            obs_list.append(obs.reshape(1, -1))
-            z_list.append(z.cpu().reshape(1, -1))
-            action_list.append(action.reshape(1, -1))
-            next_obs_list.append(next_obs.reshape(1, -1))
-            done_list.append(terminated)
-            reward_list.append(reward)
-
-            obs = next_obs
-
-        T = len(obs_list)
-        episode_dict = {
-            "observation": np.concatenate(obs_list, axis=0).astype(np.float32),      # (T, obs_dim)
-            "action":      np.concatenate(action_list, axis=0).astype(np.float32),        # (T, n_actions)
-            "z":           np.concatenate(z_list, axis=0).astype(np.float32),        # (T, z_dim)
-            "reward":      np.asarray(reward_list, dtype=np.float32).reshape(T, 1),     # (T, 1)
-            "next": {
-                "observation": np.concatenate(next_obs_list, axis=0).astype(np.float32),  # (T, obs_dim)
-                "terminated":  np.asarray(done_list, dtype=np.bool_).reshape(T, 1),       # (T, 1)
-            },
-        }
-        replay_buffer["train"].extend(episode_dict)
-
-
-        cumulative_reward += episode_reward
-
-        # --------------------------------------------------
-        # Online metrics
-        # --------------------------------------------------
-        if config.use_wandb:
-            wandb.log({
-                "metrics/cumulative_reward": cumulative_reward,
-                "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward + 1e-8)),
-                "metrics/reward_per_episode": episode_reward,
-                "metrics/task_id": current_task_id,  # Numeric ID for step plot (different colors per task)
-            }, step=episode)
+                wandb.log({
+                    "metrics/cumulative_reward": cumulative_reward,
+                    "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward + 1e-8)),
+                    "metrics/reward_per_episode": episode_reward,
+                    "metrics/task_id": task_idx,
+                }, step=global_step)
 
 
 

@@ -11,14 +11,23 @@ ROOT = Path(__file__).resolve().parents[1]
 ALGOS = ("fb_cpr", "varibad", "ptdqn")
 
 
-def build_args(env_name: str, task_list: str, seed: int, env_seed: int, device: str, num_episodes: int, task_switch_prob: float, max_episode_steps: int) -> dict[str, list[str]]:
+def build_args(
+    env_name: str,
+    task_list: str,
+    seed: int,
+    env_seed: int,
+    device: str,
+    num_steps: int,
+    max_episode_steps: int,
+    steps_per_task: int,
+) -> dict[str, list[str]]:
     common = [
         f"--env.domain_name={env_name}",
         f"--env.task_list={task_list}",
         f"--env.max_episode_steps={max_episode_steps}",
-        f"--env.task_switch_prob={task_switch_prob}",
+        f"--env.steps_per_task={steps_per_task}",
         f"--env.seed={env_seed}",
-        f"--num_episodes={num_episodes}",
+        f"--num_steps={num_steps}",
     ]
     return {
         "varibad": [str(ROOT / "crl" / "algos" / "varibad.py"), *common, f"--device={device}", f"--seed={seed}"],
@@ -40,14 +49,23 @@ def main(
     seeds: list[int] = [0],
     env_seed: int = 0,
     device: str = "cpu",
-    num_episodes: int = 10000,
-    task_switch_prob: float = 0.01,
+    num_steps: int = 0,
     max_episode_steps: int = 1000,
+    steps_per_task: int = 200000,
 ) -> None:
     algo_list = algos or list(ALGOS)
     commands = []
     for seed in seeds:
-        argv = build_args(env_name, task_list, seed, env_seed, device, num_episodes, task_switch_prob, max_episode_steps)
+        argv = build_args(
+            env_name,
+            task_list,
+            seed,
+            env_seed,
+            device,
+            num_steps,
+            max_episode_steps,
+            steps_per_task,
+        )
         for name in algo_list:
             if name not in argv:
                 continue

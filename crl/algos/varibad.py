@@ -12,7 +12,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
 from tqdm import tqdm
 
-from crl.envs import EnvConfig, make_continual_episodic_env, get_task_sequence, get_env_dims
+from crl.envs import EnvConfig, make_env, get_task_sequence, get_env_dims
 from crl.algos.ppo import PPO, Config as PPOConfig
 from crl.buffers import SimpleTrajBuffer
 
@@ -37,7 +37,7 @@ class Config:
     batch_size: int = 4096
     minibatch_size: int = 512
 
-    num_episodes: int = 10000  # number of continual episodes to run
+    num_steps: int = 0  # total train steps (0 => len(task_list)*env.steps_per_task)
     buffer_size: int = 100_000  # size of the replay buffer
 
     # VAE training
@@ -340,12 +340,11 @@ if __name__ == "__main__":
 
     print(f"task list on main: {task_list}")
 
-    env = make_continual_episodic_env(
+    env = make_env(
         env_id=config.env.domain_name,
-        task_list=task_list,
+        task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        task_switch_prob=config.env.task_switch_prob,
-        seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
+        seed=config.env.seed,  # keep env seed fixed, change only algo seed
     )
 
     s_dim, a_dim, discrete = get_env_dims(env)
@@ -391,99 +390,117 @@ if __name__ == "__main__":
     global_step = 0
     cumulative_reward = 0.0
     ppo_buffer_idx = 0
+    steps_per_task = max(1, int(config.env.steps_per_task))
+    total_steps = int(config.num_steps) if config.num_steps > 0 else len(task_list) * steps_per_task
 
-    for episode in tqdm(range(config.num_episodes), desc="Training"):
+    for current_task_idx, task_name in enumerate(task_list):
+        if global_step >= total_steps:
+            break
+        env.close()
+        env = make_env(
+            env_id=config.env.domain_name,
+            task=task_name,
+            max_episode_steps=config.env.max_episode_steps,
+            seed=config.env.seed,
+        )
+        task_steps = 0
 
-        # VAE episode collection for replay buffer
-        vae_episode = {k: [] for k in ["s", "a", "r", "sp", "d"]}
+        while task_steps < steps_per_task and global_step < total_steps:
+            vae_episode = {k: [] for k in ["s", "a", "r", "sp", "d"]}
+            obs, _ = env.reset()
+            terminated = truncated = False
+            episode_reward = 0.0
+            episode_steps = 0
+            prev_obs = None
+            prev_action = None
+            prev_reward = 0.0
 
-        obs, info = env.reset()
-        terminated = truncated = False
-        episode_reward = 0.0
-        prev_obs = None
-        prev_action = None
-        prev_reward = 0.0
+            while (
+                not (terminated or truncated)
+                and task_steps < steps_per_task
+                and global_step < total_steps
+            ):
 
-        while not (terminated or truncated):
+                with torch.no_grad():
+                    obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
 
-            with torch.no_grad():
-                obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
+                    if prev_obs is not None:
+                        if config.discrete:
+                            action_onehot = np.zeros(config.a_dim, dtype=np.float32)
+                            action_onehot[int(prev_action)] = 1.0
+                            prev_action_arr = action_onehot
+                        else:
+                            prev_action_arr = np.asarray(prev_action, dtype=np.float32).flatten()
 
-                if prev_obs is not None:
-                    if config.discrete:
-                        action_onehot = np.zeros(config.a_dim, dtype=np.float32)
-                        action_onehot[int(prev_action)] = 1.0
-                        prev_action_arr = action_onehot
+                        x_t_np = np.concatenate([
+                            prev_obs.flatten(),
+                            prev_action_arr,
+                            [prev_reward],
+                            obs.flatten(),
+                            [0.0]  # done=0 during episode
+                        ], dtype=np.float32)
+                        x_t = torch.from_numpy(x_t_np).unsqueeze(0).to(config.device)
                     else:
-                        prev_action_arr = np.asarray(prev_action, dtype=np.float32).flatten()
+                        x_t = None
 
-                    x_t_np = np.concatenate([
-                        prev_obs.flatten(),
-                        prev_action_arr,
-                        [prev_reward],
-                        obs.flatten(),
-                        [0.0]  # done=0 during episode
-                    ], dtype=np.float32)
-                    x_t = torch.from_numpy(x_t_np).unsqueeze(0).to(config.device)
-                else:
-                    x_t = None
+                    action, logprob, entropy, value, info_dict = agent.act(obs_tensor, x_t, values=True)
+                    z_pol = info_dict["z_pol"]
 
-                action, logprob, entropy, value, info_dict = agent.act(obs_tensor, x_t, values=True)
-                z_pol = info_dict["z_pol"]
+                    action_np = action.cpu().item() if config.discrete else action.cpu().numpy()[0]
 
-                action_np = action.cpu().item() if config.discrete else action.cpu().numpy()[0]
+                next_obs, reward, terminated, truncated, info = env.step(action_np)
+                episode_steps += 1
+                if episode_steps >= config.env.max_episode_steps:
+                    truncated = True
+                done = terminated or truncated
 
-            next_obs, reward, terminated, truncated, info = env.step(action_np)
-            done = terminated or truncated
+                obs_aug = torch.cat([obs_tensor.squeeze(0), z_pol.squeeze(0)], dim=-1)
+                obs_buffer[ppo_buffer_idx] = obs_aug
+                actions_buffer[ppo_buffer_idx] = action.squeeze(0)
+                logprobs_buffer[ppo_buffer_idx] = logprob.item()
+                rewards_buffer[ppo_buffer_idx] = reward
+                dones_buffer[ppo_buffer_idx] = float(done)
+                values_buffer[ppo_buffer_idx] = value.item()
+                ppo_buffer_idx += 1
 
-            obs_aug = torch.cat([obs_tensor.squeeze(0), z_pol.squeeze(0)], dim=-1)
-            obs_buffer[ppo_buffer_idx] = obs_aug
-            actions_buffer[ppo_buffer_idx] = action.squeeze(0)
-            logprobs_buffer[ppo_buffer_idx] = logprob.item()
-            rewards_buffer[ppo_buffer_idx] = reward
-            dones_buffer[ppo_buffer_idx] = float(done)
-            values_buffer[ppo_buffer_idx] = value.item()
-            ppo_buffer_idx += 1
+                vae_episode["s"].append(obs)
+                vae_episode["a"].append(action_np)
+                vae_episode["r"].append([reward])
+                vae_episode["sp"].append(next_obs)
+                vae_episode["d"].append([float(done)])
 
-            vae_episode["s"].append(obs)
-            vae_episode["a"].append(action_np)
-            vae_episode["r"].append([reward])
-            vae_episode["sp"].append(next_obs)
-            vae_episode["d"].append([float(done)])
+                episode_reward += reward
+                cumulative_reward += reward
+                global_step += 1
+                task_steps += 1
 
-            episode_reward += reward
-            global_step += 1
+                prev_obs = obs
+                prev_action = action_np
+                prev_reward = reward
+                obs = next_obs
 
-            prev_obs = obs
-            prev_action = action_np
-            prev_reward = reward
-            obs = next_obs
+                if ppo_buffer_idx == config.ppo.batch_size + 1:
+                    rollout = {
+                        "obs": obs_buffer[:config.ppo.batch_size],
+                        "actions": actions_buffer[:config.ppo.batch_size],
+                        "logprobs": logprobs_buffer[:config.ppo.batch_size],
+                        "rewards": rewards_buffer[:config.ppo.batch_size],
+                        "dones": dones_buffer[:config.ppo.batch_size],
+                        "values": values_buffer[:config.ppo.batch_size + 1],
+                    }
+                    metrics = agent.update(rollout, replay_buffer)
+                    ppo_buffer_idx = 0
 
-            if ppo_buffer_idx == config.ppo.batch_size + 1:
-                rollout = {
-                    "obs": obs_buffer[:config.ppo.batch_size],
-                    "actions": actions_buffer[:config.ppo.batch_size],
-                    "logprobs": logprobs_buffer[:config.ppo.batch_size],
-                    "rewards": rewards_buffer[:config.ppo.batch_size],
-                    "dones": dones_buffer[:config.ppo.batch_size],
-                    "values": values_buffer[:config.ppo.batch_size + 1],
-                }
-                metrics = agent.update(rollout, replay_buffer)
-                #if config.use_wandb:
-                    #wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
-                ppo_buffer_idx = 0
+            if len(vae_episode["s"]) > 0:
+                for key in vae_episode:
+                    vae_episode[key] = torch.tensor(np.array(vae_episode[key]), dtype=torch.float32)
+                replay_buffer.add_episode(vae_episode)
 
-        cumulative_reward += episode_reward
-
-        for key in vae_episode:
-            vae_episode[key] = torch.tensor(np.array(vae_episode[key]), dtype=torch.float32)
-        replay_buffer.add_episode(vae_episode)
-
-        if config.use_wandb:
-            wandb.log({
-                "metrics/cumulative_reward": cumulative_reward,
-                "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward + 1e-8)),
-                "metrics/reward_per_episode": episode_reward,
-                "metrics/task_id": env.get_task_id(),
-            }, step=episode)
+            if config.use_wandb:
+                wandb.log({
+                    "metrics/cumulative_reward": cumulative_reward,
+                    "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward + 1e-8)),
+                    "metrics/reward_per_episode": episode_reward,
+                    "metrics/task_id": current_task_idx,
+                }, step=global_step)
 
