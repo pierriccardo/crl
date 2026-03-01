@@ -167,12 +167,12 @@ class Config:
     buffer_size: int = 100_000
     expert_buffer_size: int = 1000
     expert_buffer_max: int = 100  # Keep only top N episodes by reward on the expert
-    warmup_steps: int = 20_000
+    warmup_steps: int = 2_000  # steps before first update (was 20k; too many random trajectories)
 
-    train_freq_steps: int = 10_000  # gradient update every N env steps
+    train_freq_steps: int = 1000  # gradient update every N env steps
+
     z_inference_freq: int = 256    # re-infer task latent every N steps; 0 = once per episode
-    z_inference_samples: int = 256  # number of (next_obs, reward) pairs fed to reward_inference
-    num_inference_samples: int = 5000
+    z_inference_samples: int = 10_000  # number of (next_obs, reward) pairs fed to reward_inference
     temperature: float = 0.1 # Temp for discrete action policy
 
     # eval
@@ -1762,27 +1762,7 @@ class FBcprAgent(FBAgent):
         return output_metrics
 
 
-def _cosine_sim_matrix(Z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    Z: (N, d) matrix of task embeddings
-    Returns: (N, N) cosine similarity matrix
-    """
-    norms = np.linalg.norm(Z, axis=1, keepdims=True)
-    norms = np.maximum(norms, eps)
-    Zn = Z / norms
-    return Zn @ Zn.T
-
-
-_BEST_EVAL_RETURNS: Dict[str, float] = {}
-
-
-def _get_seen_tasks(config, task_list: List[str], episode_idx: int) -> List[str]:
-    budget = max(1, int(getattr(config.env, "steps_per_task", 1)))
-    seen = min(len(task_list), (int(episode_idx) // budget) + 1)
-    return list(task_list[:seen])
-
-
-def eval(agent, config, t):
+def eval(agent, config):
 
     task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
     print(f"task list on eval: {task_list}")
@@ -1800,14 +1780,14 @@ def eval(agent, config, t):
         action_space = eval_env.action_space
         next_obs_list, rewards_list = [], []
 
-        print(f"Collecting {config.num_inference_samples} samples from {task} using uniform policy...")
+        print(f"Collecting {config.z_inference_samples} samples from {task} using uniform policy...")
         num_collected = 0
 
         obs, _ = eval_env.reset()
         obs = np.asarray(obs, dtype=np.float32)
         terminated = truncated = False
 
-        while num_collected < config.num_inference_samples:
+        while num_collected < config.z_inference_samples:
             if terminated or truncated:
                 obs, _ = eval_env.reset()
                 obs = np.asarray(obs, dtype=np.float32)
@@ -1843,47 +1823,10 @@ def eval(agent, config, t):
         task_zs[task] = z.cpu().numpy().flatten()
         print(f"Inferred z for {task} from {len(rewards_list)} samples")
 
-    # --------------------------------------------------
-    # Compute and log similarity between each task
-    # --------------------------------------------------
-    # Compute pairwise cosine similarities between task z vectors
-    Z = np.stack([task_zs[task] for task in task_list], axis=0)  # (N, d)
-    S = _cosine_sim_matrix(Z)  # (N, N)
-
-    if config.use_wandb:
-        # Log as a queryable Table
-        sim_table = wandb.Table(columns=["eval_step", "task_i", "task_j", "cosine_sim"])
-        for i, ti in enumerate(task_list):
-            for j, tj in enumerate(task_list):
-                sim_table.add_data(int(t), str(ti), str(tj), float(S[i, j]))
-
-            try:
-                sim_heatmap = wandb.plot.heatmap(
-                    xs=task_list,
-                    ys=task_list,
-                    values=S,
-                    title=f"Task cosine similarity @ step {t}",
-                )
-            except Exception:
-                sim_heatmap = None
-
-            log_payload = {
-                "eval_step": int(t),
-                "task_similarity/table": sim_table,
-            }
-            if sim_heatmap is not None:
-                log_payload["task_similarity/heatmap"] = sim_heatmap
-
-            wandb.log(log_payload, step=t)
 
     # --------------------------------------------------
     # Evaluate each inferred z
     # --------------------------------------------------
-    if config.use_wandb:
-        # One table for all tasks at this eval step (preferred)
-        returns_table = wandb.Table(columns=["eval_step", "task", "episode", "return"])
-
-    per_task_mean = {}
     for task in task_list:
         z = torch.tensor(task_zs[task], device=agent.device).reshape(1, -1)
         # TODO: double env creation, fix
@@ -1893,8 +1836,6 @@ def eval(agent, config, t):
         for ep in range(config.num_eval_episodes):
             obs, _ = eval_env.reset()
             obs = np.asarray(obs, dtype=np.float32)
-            if obs.size == 0:
-                raise ValueError(f"Empty observation from {task} environment reset")
 
             terminated = truncated = False
             while not (terminated or truncated):
@@ -1907,49 +1848,17 @@ def eval(agent, config, t):
                 action_env = discretize_action_for_env(action, eval_env.action_space)
                 next_obs, reward, terminated, truncated, info = eval_env.step(action_env)
                 next_obs = np.asarray(next_obs, dtype=np.float32)
-                if next_obs.size == 0:
-                    raise ValueError(f"Empty observation from {task} environment step")
                 total_reward[ep] += reward
                 obs = next_obs
 
-            if config.use_wandb:
-                returns_table.add_data(int(t), str(task), int(ep), float(total_reward[ep]))
-        # Scalars: these are what you use for CI across seeds
         mean_r = float(np.mean(total_reward))
         std_r = float(np.std(total_reward))
-        per_task_mean[task] = mean_r
 
         if config.use_wandb:
             wandb.log({
                 f"eval/{task}/reward_mean": mean_r,
                 f"eval/{task}/reward_std": std_r,
-            }, step=t)
-
-    seen_tasks = _get_seen_tasks(config, task_list, int(t))
-    if per_task_mean:
-        avg_all = float(np.mean([per_task_mean[k] for k in task_list]))
-        avg_seen = float(np.mean([per_task_mean[k] for k in seen_tasks]))
-        for task, value in per_task_mean.items():
-            prev_best = _BEST_EVAL_RETURNS.get(task, -np.inf)
-            _BEST_EVAL_RETURNS[task] = max(prev_best, float(value))
-        forgetting_seen = float(
-            np.mean([_BEST_EVAL_RETURNS[k] - per_task_mean[k] for k in seen_tasks])
-        )
-    else:
-        avg_all = 0.0
-        avg_seen = 0.0
-        forgetting_seen = 0.0
-
-    if config.use_wandb:
-        # Log the per-episode returns table once per eval step
-        wandb.log({
-            "eval_step": int(t),
-            "eval/returns_table": returns_table,
-            "eval/avg_reward_all_tasks": avg_all,
-            "eval/avg_reward_seen_tasks": avg_seen,
-            "eval/forgetting_seen_tasks": forgetting_seen,
-            "eval/num_seen_tasks": len(seen_tasks),
-        }, step=t)
+            })
 
 
 if __name__ == "__main__":
@@ -2100,10 +2009,13 @@ if __name__ == "__main__":
                 }
                 replay_buffer["train"].extend(episode_dict)
 
+                # Expert buffer: only add after warmup so it isn't filled with random trajectories
                 add = (
-                    global_step < config.warmup_steps
-                    or len(expert_rewards) < config.expert_buffer_max
-                    or (expert_rewards and episode_return > min(expert_rewards.values()))
+                    global_step >= config.warmup_steps
+                    and (
+                        len(expert_rewards) < config.expert_buffer_max
+                        or (expert_rewards and episode_return > min(expert_rewards.values()))
+                    )
                 )
                 if add:
                     replay_buffer["expert_slicer"].extend([episode_dict])
@@ -2123,14 +2035,6 @@ if __name__ == "__main__":
                     expert_rewards = keep
                     expert_data = {k: v for k, v in expert_data.items() if k in keep}
 
-                episode_return = 0.0
-                obs_list, z_list, action_list, reward_list, next_obs_list, done_list = [], [], [], [], [], []
-                episode_idx += 1
-
-                obs, _ = env.reset()
-                terminated = truncated = False
-                episode_steps = 0
-
                 pbar.set_postfix(
                     task=f"{task_idx+1}/{len(task_list)} {current_task}",
                     ep_return=f"{episode_return:.2f}",
@@ -2138,16 +2042,24 @@ if __name__ == "__main__":
                 )
 
                 if config.use_wandb:
-                    wandb.log({"train/episode_return": np.mean(last_n_rewards)},step=global_step)
+                    wandb.log({"train/episode_return": episode_return}, step=global_step)
 
-            if config.use_wandb and config.log_freq > 0 and global_step % config.log_freq == 0:
-                wandb.log(
-                    {
-                        "train/last_n_rewards": np.mean(last_n_rewards),
-                        "train/task_id": task_idx,
-                    },
-                    step=global_step,
-                )
+                if config.use_wandb and config.log_freq > 0 and global_step % config.log_freq == 0:
+                    wandb.log(
+                        {
+                            "train/last_n_rewards": np.sum(last_n_rewards),
+                            "train/task_id": task_idx,
+                        },
+                        step=global_step,
+                    )
+
+                episode_return = 0.0
+                obs_list, z_list, action_list, reward_list, next_obs_list, done_list = [], [], [], [], [], []
+                episode_idx += 1
+
+                obs, _ = env.reset()
+                terminated = truncated = False
+                episode_steps = 0
 
     pbar.close()
 

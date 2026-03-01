@@ -7,7 +7,10 @@ requires-python = ">=3.13"
 dependencies = [
     "brax>=0.14.1",
     "gymnasium>=1.2.3",
+    "jax[cuda12-local]>=0.9.0.1",
     "matplotlib>=3.10.8",
+    "metaworld>=3.0.0",
+    "minigrid>=3.0.0",
     "numpy>=2.4.2",
     "playground>=0.1.0",
     "safetensors>=0.7.0",
@@ -16,3 +19,11 @@ dependencies = [
     "tyro>=1.0.8",
     "wandb>=0.25.0",
 ]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crl", "crl.*"]

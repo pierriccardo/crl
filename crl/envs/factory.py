@@ -22,7 +22,7 @@ from crl.envs.wrappers import (
     MjxGymnasiumWrapper,
 )
 
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 
 _REGISTRY: Dict[str, Callable[..., gym.Env]] = {}
 
@@ -217,18 +217,57 @@ def make_env(
 
 
 def get_task_sequence(env_name: str, sequence_name: str) -> list[str]:
-    """Retrieve a task sequence by environment and sequence name."""
+    """Retrieve a task sequence by environment and sequence name.
+
+    If sequence_name equals env_name (e.g. both 'mjx/humanoid'), treats it as a request
+    for the default sequence and returns 'default', then 'full', then the first available.
+    """
     env_key = env_name.lower()
     sequence_key = sequence_name.lower()
 
     if env_key not in _TASK_SEQUENCES:
         raise ValueError(f"No task sequences registered for environment '{env_name}'")
 
-    if sequence_key not in _TASK_SEQUENCES[env_key]:
-        available = ", ".join(sorted(_TASK_SEQUENCES[env_key].keys()))
+    seqs = _TASK_SEQUENCES[env_key]
+    if sequence_key in seqs:
+        return seqs[sequence_key]
+
+    if sequence_key != env_key:
+        available = ", ".join(sorted(seqs.keys()))
         raise ValueError(f"Unknown sequence '{sequence_name}' for env '{env_name}'. Available: {available}")
 
-    return _TASK_SEQUENCES[env_key][sequence_key]
+    # sequence_name was the same as env_name (e.g. --env.task_list=mjx/humanoid): use default
+    for fallback in ("default", "full"):
+        if fallback in seqs:
+            return seqs[fallback]
+    return seqs[next(iter(seqs))]
+
+
+def list_task_sequences(env_name: Optional[str] = None) -> Dict[str, list[str]] | Dict[str, Dict[str, list[str]]]:
+    """List task sequences for an env, or for all envs.
+
+    Args:
+        env_name: If set, return sequences for this environment only; otherwise all envs.
+
+    Returns:
+        If env_name is set: dict mapping sequence_name -> list of task ids for that env.
+        If env_name is None: dict mapping env_name -> { sequence_name -> list of task ids }.
+    """
+    if env_name is None:
+        return {k: dict(v) for k, v in _TASK_SEQUENCES.items()}
+    env_key = env_name.lower()
+    if env_key not in _TASK_SEQUENCES:
+        return {}
+    return dict(_TASK_SEQUENCES[env_key])
+
+
+def list_all_sequences() -> list[tuple[str, str]]:
+    """Return all (env_name, sequence_name) pairs for iteration or display."""
+    out = []
+    for env_key in sorted(_TASK_SEQUENCES.keys()):
+        for seq_key in sorted(_TASK_SEQUENCES[env_key].keys()):
+            out.append((env_key, seq_key))
+    return out
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ class Config:
     norm_adv: bool = True
     clip_coef: float = 0.2
     clip_vloss: bool = True
-    ent_coef: float = 0.00
+    ent_coef: float = 0.01  # entropy bonus for exploration
     vf_coef: float = 0.5
 
     # train

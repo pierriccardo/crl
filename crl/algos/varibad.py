@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from dataclasses import dataclass, asdict, field
 from typing import Any, Optional
+from collections import deque
 from tqdm import tqdm
 
 from crl.envs import EnvConfig, make_env, get_task_sequence, get_env_dims
@@ -39,6 +40,10 @@ class Config:
 
     num_steps: int = 0  # total train steps (0 => len(task_list)*env.steps_per_task)
     buffer_size: int = 100_000  # size of the replay buffer
+
+    warmup_steps: int = 2_000  # steps before first PPO/VAE update (avoid long random-only phase)
+    #train_freq_steps: int = 1000  # unused; varibad updates when PPO rollout buffer is full (for API parity with fb_cpr)
+    log_freq: int = 100
 
     # VAE training
     vae_batch_size: int = 32  # Number of episodes per VAE batch (reduced from 64)
@@ -333,38 +338,32 @@ if __name__ == "__main__":
             config=asdict(config)
         )
 
-    if isinstance(config.env.task_list, str):
-        task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
-    else:
-        task_list = config.env.task_list
-
+    task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
     print(f"task list on main: {task_list}")
 
     env = make_env(
         env_id=config.env.domain_name,
         task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        seed=config.env.seed,  # keep env seed fixed, change only algo seed
+        seed=config.env.seed,
     )
 
     s_dim, a_dim, discrete = get_env_dims(env)
     config.s_dim = s_dim
     config.a_dim = a_dim
     config.discrete_actions = discrete
+    config.discrete = discrete  # for backward compat in loop
 
     if not config.discrete_actions:
         config.ppo.action_low = env.action_space.low
         config.ppo.action_high = env.action_space.high
         print(f"action_low: {config.ppo.action_low}, action_high: {config.ppo.action_high}")
 
-
-    # Auto-set VAE sequence length if not specified
     if config.vae_seq_length == -1:
         config.vae_seq_length = max(8, config.env.max_episode_steps // 3)
         print(f"Auto-set vae_seq_length to {config.vae_seq_length} (max_episode_steps={config.env.max_episode_steps})")
-    # Ensure vae_seq_length <= max_episode_steps to avoid infinite loop in buffer.sample()
     if config.vae_seq_length > config.env.max_episode_steps:
-        print(f"Warning: vae_seq_length ({config.vae_seq_length}) > max_episode_steps ({config.env.max_episode_steps}). Capping to max_episode_steps.")
+        print(f"Warning: vae_seq_length ({config.vae_seq_length}) > max_episode_steps ({config.env.max_episode_steps}). Capping.")
         config.vae_seq_length = config.env.max_episode_steps
 
     agent = VariBAD(config)
@@ -375,9 +374,8 @@ if __name__ == "__main__":
         capacity_episodes=config.buffer_size
     )
 
-
     obs_buffer = torch.zeros((config.ppo.batch_size + 1, config.s_dim + config.z_dim)).to(config.device)
-    if config.discrete:
+    if config.discrete_actions:
         actions_buffer = torch.zeros((config.ppo.batch_size + 1,), dtype=torch.long).to(config.device)
     else:
         actions_buffer = torch.zeros((config.ppo.batch_size + 1, config.a_dim)).to(config.device)
@@ -386,100 +384,97 @@ if __name__ == "__main__":
     dones_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
     values_buffer = torch.zeros((config.ppo.batch_size + 1)).to(config.device)
 
-
-    global_step = 0
-    cumulative_reward = 0.0
-    ppo_buffer_idx = 0
     steps_per_task = max(1, int(config.env.steps_per_task))
     total_steps = int(config.num_steps) if config.num_steps > 0 else len(task_list) * steps_per_task
 
-    for current_task_idx, task_name in enumerate(task_list):
-        if global_step >= total_steps:
-            break
-        env.close()
+    global_step = 0
+    episode_idx = 0
+    ppo_buffer_idx = 0
+
+    pbar = tqdm(total=total_steps, desc="Training", unit="step", dynamic_ncols=True)
+
+    for task_idx, current_task in enumerate(task_list):
+
         env = make_env(
             env_id=config.env.domain_name,
-            task=task_name,
+            task=current_task,
             max_episode_steps=config.env.max_episode_steps,
             seed=config.env.seed,
         )
-        task_steps = 0
 
-        while task_steps < steps_per_task and global_step < total_steps:
-            vae_episode = {k: [] for k in ["s", "a", "r", "sp", "d"]}
-            obs, _ = env.reset()
-            terminated = truncated = False
-            episode_reward = 0.0
-            episode_steps = 0
-            prev_obs = None
-            prev_action = None
-            prev_reward = 0.0
+        obs, _ = env.reset()
+        terminated = truncated = False
+        episode_return = 0.0
+        last_n_rewards = deque(maxlen=100)
+        episode_steps = 0
+        prev_obs = None
+        prev_action = None
+        prev_reward = 0.0
+        vae_episode = {k: [] for k in ["s", "a", "r", "sp", "d"]}
+        agent.reset()
 
-            while (
-                not (terminated or truncated)
-                and task_steps < steps_per_task
-                and global_step < total_steps
-            ):
+        for task_step in range(steps_per_task):
 
-                with torch.no_grad():
-                    obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
 
-                    if prev_obs is not None:
-                        if config.discrete:
-                            action_onehot = np.zeros(config.a_dim, dtype=np.float32)
-                            action_onehot[int(prev_action)] = 1.0
-                            prev_action_arr = action_onehot
-                        else:
-                            prev_action_arr = np.asarray(prev_action, dtype=np.float32).flatten()
-
-                        x_t_np = np.concatenate([
-                            prev_obs.flatten(),
-                            prev_action_arr,
-                            [prev_reward],
-                            obs.flatten(),
-                            [0.0]  # done=0 during episode
-                        ], dtype=np.float32)
-                        x_t = torch.from_numpy(x_t_np).unsqueeze(0).to(config.device)
+                if prev_obs is not None:
+                    if config.discrete_actions:
+                        action_onehot = np.zeros(config.a_dim, dtype=np.float32)
+                        action_onehot[int(prev_action)] = 1.0
+                        prev_action_arr = action_onehot
                     else:
-                        x_t = None
+                        prev_action_arr = np.asarray(prev_action, dtype=np.float32).flatten()
+                    x_t_np = np.concatenate([
+                        prev_obs.flatten(),
+                        prev_action_arr,
+                        [prev_reward],
+                        obs.flatten(),
+                        [0.0]
+                    ], dtype=np.float32)
+                    x_t = torch.from_numpy(x_t_np).unsqueeze(0).to(config.device)
+                else:
+                    x_t = None
 
-                    action, logprob, entropy, value, info_dict = agent.act(obs_tensor, x_t, values=True)
-                    z_pol = info_dict["z_pol"]
+                action, logprob, entropy, value, info_dict = agent.act(obs_tensor, x_t, values=True)
+                z_pol = info_dict["z_pol"]
+                action_np = action.cpu().item() if config.discrete_actions else action.cpu().numpy()[0]
 
-                    action_np = action.cpu().item() if config.discrete else action.cpu().numpy()[0]
+            next_obs, reward, terminated, truncated, info = env.step(action_np)
+            episode_steps += 1
+            if episode_steps >= config.env.max_episode_steps:
+                truncated = True
+            done = terminated or truncated
 
-                next_obs, reward, terminated, truncated, info = env.step(action_np)
-                episode_steps += 1
-                if episode_steps >= config.env.max_episode_steps:
-                    truncated = True
-                done = terminated or truncated
+            episode_return += reward
+            last_n_rewards.append(reward)
+            global_step += 1
+            if global_step % 10 == 0:
+                pbar.update(10)
 
-                obs_aug = torch.cat([obs_tensor.squeeze(0), z_pol.squeeze(0)], dim=-1)
-                obs_buffer[ppo_buffer_idx] = obs_aug
-                actions_buffer[ppo_buffer_idx] = action.squeeze(0)
-                logprobs_buffer[ppo_buffer_idx] = logprob.item()
-                rewards_buffer[ppo_buffer_idx] = reward
-                dones_buffer[ppo_buffer_idx] = float(done)
-                values_buffer[ppo_buffer_idx] = value.item()
-                ppo_buffer_idx += 1
+            obs_aug = torch.cat([obs_tensor.squeeze(0), z_pol.squeeze(0)], dim=-1)
+            obs_buffer[ppo_buffer_idx] = obs_aug
+            actions_buffer[ppo_buffer_idx] = action.squeeze(0)
+            logprobs_buffer[ppo_buffer_idx] = logprob.item()
+            rewards_buffer[ppo_buffer_idx] = reward
+            dones_buffer[ppo_buffer_idx] = float(done)
+            values_buffer[ppo_buffer_idx] = value.item()
+            ppo_buffer_idx += 1
 
-                vae_episode["s"].append(obs)
-                vae_episode["a"].append(action_np)
-                vae_episode["r"].append([reward])
-                vae_episode["sp"].append(next_obs)
-                vae_episode["d"].append([float(done)])
+            vae_episode["s"].append(obs)
+            vae_episode["a"].append(action_np)
+            vae_episode["r"].append([reward])
+            vae_episode["sp"].append(next_obs)
+            vae_episode["d"].append([float(done)])
 
-                episode_reward += reward
-                cumulative_reward += reward
-                global_step += 1
-                task_steps += 1
+            prev_obs = obs
+            prev_action = action_np
+            prev_reward = reward
+            obs = next_obs
 
-                prev_obs = obs
-                prev_action = action_np
-                prev_reward = reward
-                obs = next_obs
-
-                if ppo_buffer_idx == config.ppo.batch_size + 1:
+            # PPO update when rollout buffer full and past warmup
+            if ppo_buffer_idx == config.ppo.batch_size + 1:
+                if global_step >= config.warmup_steps:
                     rollout = {
                         "obs": obs_buffer[:config.ppo.batch_size],
                         "actions": actions_buffer[:config.ppo.batch_size],
@@ -489,18 +484,46 @@ if __name__ == "__main__":
                         "values": values_buffer[:config.ppo.batch_size + 1],
                     }
                     metrics = agent.update(rollout, replay_buffer)
-                    ppo_buffer_idx = 0
+                    if config.use_wandb:
+                        wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
+                ppo_buffer_idx = 0
 
-            if len(vae_episode["s"]) > 0:
-                for key in vae_episode:
-                    vae_episode[key] = torch.tensor(np.array(vae_episode[key]), dtype=torch.float32)
-                replay_buffer.add_episode(vae_episode)
+            # Episode termination: log, reset episode state, reset env
+            if terminated or truncated:
+                # Only add to VAE buffer after warmup so it isn't filled with random trajectories
+                if len(vae_episode["s"]) > 0 and global_step >= config.warmup_steps:
+                    for key in vae_episode:
+                        vae_episode[key] = torch.tensor(np.array(vae_episode[key]), dtype=torch.float32)
+                    replay_buffer.add_episode(vae_episode)
 
-            if config.use_wandb:
-                wandb.log({
-                    "metrics/cumulative_reward": cumulative_reward,
-                    "metrics/log_cumulative_reward": np.log(max(1e-8, cumulative_reward + 1e-8)),
-                    "metrics/reward_per_episode": episode_reward,
-                    "metrics/task_id": current_task_idx,
-                }, step=global_step)
+                pbar.set_postfix(
+                    task=f"{task_idx+1}/{len(task_list)} {current_task}",
+                    ep_return=f"{episode_return:.2f}",
+                    avg_r=f"{np.mean(last_n_rewards):.3f}",
+                )
+
+                if config.use_wandb:
+                    wandb.log({"train/episode_return": episode_return}, step=global_step)
+                if config.use_wandb and config.log_freq > 0 and global_step % config.log_freq == 0:
+                    wandb.log(
+                        {
+                            "train/last_n_rewards": np.mean(last_n_rewards),
+                            "train/task_id": task_idx,
+                        },
+                        step=global_step,
+                    )
+
+                episode_return = 0.0
+                episode_idx += 1
+                prev_obs = None
+                prev_action = None
+                prev_reward = 0.0
+                vae_episode = {k: [] for k in ["s", "a", "r", "sp", "d"]}
+                agent.reset()
+
+                obs, _ = env.reset()
+                terminated = truncated = False
+                episode_steps = 0
+
+    pbar.close()
 
