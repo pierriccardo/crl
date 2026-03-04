@@ -43,7 +43,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Tuple, List, Any
 
 
-from crl.envs import EnvConfig, make_env, get_env_dims
+from crl.envs import EnvConfig, make_env, make_vec_env, get_env_dims
 
 
 def get_checkpoint_dir(
@@ -81,6 +81,7 @@ class Config:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     norm_adv: bool = True
+    norm_obs: bool = True
     clip_coef: float = 0.2
     clip_vloss: bool = True
     ent_coef: float = 0.01  # entropy bonus for exploration
@@ -89,15 +90,14 @@ class Config:
     # train
     n_steps: int = 100_000
     n_epochs: int = 5
-    n_agents: int = 1  # Number of agents in parallel, N
-    batch_size: int = 4096  # A.k.a. horizon, T
+    batch_size: int = 4096  # Steps per env per rollout (horizon), T
     minibatch_size: int = 512
 
     window_size: int = 100
     log_freq: int = 100
 
     # generic optimization parameters
-    clip_grad_norm: float | None = None  # usually 0.5
+    clip_grad_norm: float | None = 0.5
 
     # Wandb
     use_wandb: bool = True
@@ -149,17 +149,17 @@ class Actor(nn.Module):
         self.register_buffer("action_low", torch.as_tensor(action_low, dtype=torch.float32))
         self.register_buffer("action_high", torch.as_tensor(action_high, dtype=torch.float32))
         self.net = nn.Sequential(
-            nn.Linear(s_dim, 256),
+            nn.Linear(s_dim, 1024),
             nn.Tanh(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 1024),
             nn.Tanh(),
         )
 
         if self.discrete:
-            self.logits_head = nn.Linear(256, a_dim)
+            self.logits_head = nn.Linear(1024, a_dim)
             self.logstd = None
         else:
-            self.mu_head = nn.Linear(256, a_dim)
+            self.mu_head = nn.Linear(1024, a_dim)
             self.logstd = nn.Parameter(torch.zeros(a_dim))
 
         init_mlp_weights(
@@ -199,6 +199,7 @@ class Actor(nn.Module):
             u = dist.transforms[0].inv(a)
             logprob = dist.log_prob(a).sum(dim=-1)
             base = dist.base_dist
+            # Squashed entropy: H(Y) = H(X) + E[log|dy/dx|]; TanhTransform gives log|da/du| = log(1-a²)
             log_det = dist.transforms[0].log_abs_det_jacobian(u, a)
             entropy = base.entropy().sum(dim=-1) + log_det.sum(dim=-1)
 
@@ -211,17 +212,71 @@ class Critic(nn.Module):
     def __init__(self, s_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(s_dim, 256),
+            nn.Linear(s_dim, 1024),
             nn.Tanh(),
-            nn.Linear(256, 256),
+            nn.Linear(1024, 1024),
             nn.Tanh(),
-            nn.Linear(256, 1),
+            nn.Linear(1024, 1024),
+            nn.Tanh(),
+            nn.Linear(1024, 1),
         )
         init_mlp_weights(self.net, last_gain=1.0)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # Return value shape (B,)
         return self.net(s).squeeze(-1)
+
+
+# ==================================================
+# Observation normalization
+# ==================================================
+
+
+class RunningMeanStd:
+    """Welford's online algorithm for tracking running mean/variance.
+
+    Works with batched updates: call ``update(batch)`` where batch has
+    shape ``(B, *shape)`` and the statistics are maintained per-feature
+    (i.e. over the leading ``B`` dimension).
+    """
+
+    def __init__(self, shape: tuple = (), eps: float = 1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = eps
+        self.eps = eps
+
+    def update(self, batch: np.ndarray):
+        batch = np.asarray(batch, dtype=np.float64)
+        if batch.ndim == len(self.mean.shape):
+            batch = batch[np.newaxis]
+        batch_mean = batch.mean(axis=0)
+        batch_var = batch.var(axis=0)
+        batch_count = batch.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
+        self.mean = new_mean
+        self.var = m2 / total_count
+        self.count = total_count
+
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        return ((np.asarray(x, dtype=np.float64) - self.mean)
+                / np.sqrt(self.var + self.eps)).astype(np.float32)
+
+    def state_dict(self) -> dict:
+        return {"mean": self.mean.copy(), "var": self.var.copy(), "count": float(self.count)}
+
+    def load_state_dict(self, state: dict):
+        self.mean = np.asarray(state["mean"], dtype=np.float64)
+        self.var = np.asarray(state["var"], dtype=np.float64)
+        self.count = float(state["count"])
 
 
 # ==================================================
@@ -242,6 +297,32 @@ class PPO:
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.a_lr, eps=1e-8, )
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.c_lr, eps=1e-8)
+
+        self.obs_rms = RunningMeanStd(shape=(config.s_dim,)) if config.norm_obs else None
+
+    def normalize_obs(self, obs: np.ndarray | torch.Tensor, update: bool = True) -> np.ndarray | torch.Tensor:
+        """Normalize observations using running mean/std.
+
+        Accepts both numpy arrays and torch tensors. When a torch tensor is
+        passed the return value is a torch tensor on the same device.
+
+        Args:
+            obs: raw observations, shape ``(N, s_dim)`` or ``(s_dim,)``.
+            update: if True, update running statistics (use False at eval time).
+        """
+        if self.obs_rms is None:
+            if isinstance(obs, torch.Tensor):
+                return obs.float()
+            return np.asarray(obs, dtype=np.float32)
+
+        is_torch = isinstance(obs, torch.Tensor)
+        obs_np = obs.detach().cpu().numpy() if is_torch else np.asarray(obs, dtype=np.float32)
+        if update:
+            self.obs_rms.update(obs_np)
+        normalized = self.obs_rms.normalize(obs_np)
+        if is_torch:
+            return torch.from_numpy(normalized).to(device=obs.device)
+        return normalized
 
     def act(self, s: torch.Tensor, values: bool = False):
         action, logprob, entropy = self.actor(s)
@@ -265,14 +346,20 @@ class PPO:
 
     def update(self, rollout: Dict[str, torch.Tensor]):
         """
-        rollout: Dict[str, torch.Tensor]
-        - obs:      (T, S)
-        - actions:  (T, A)
-        - logprobs: (T,)
-        - values:   (T,)
-        - rewards:  (T,)
-        - dones:    (T,)
+        rollout keys (all flat, first dim = B = T * N with vectorized envs):
+        - obs:        (B, S)
+        - actions:    (B, A)  or (B,) for discrete
+        - logprobs:   (B,)
+        - values:     (B,)   -- rollout values for clipped value loss
+        - advantages: (B,)   -- pre-computed GAE advantages
+        - returns:    (B,)   -- advantages + values
         """
+        B = rollout["obs"].shape[0]
+        advantages = rollout["advantages"]
+        b_returns = rollout["returns"]
+
+        if self.config.norm_adv:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         metrics = [{
             "pg_loss": 0,
@@ -282,21 +369,13 @@ class PPO:
             "critic_loss": 0,
         } for _ in range(self.config.n_epochs)]
 
-        advantages = self.gae(rollout["rewards"], rollout["values"], rollout["dones"])
-        b_returns = advantages + rollout["values"][:-1]
-
-        if self.config.norm_adv:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
         for epoch in range(self.config.n_epochs):
-            # Create a random permutation of indices shuffle the batch
-            indices = torch.randperm(self.config.batch_size)
+            indices = torch.randperm(B, device=rollout["obs"].device)
 
             sgd_steps = 0
-            for start_idx in range(0, self.config.batch_size, self.config.minibatch_size):
+            for start_idx in range(0, B, self.config.minibatch_size):
                 end_idx = start_idx + self.config.minibatch_size
                 mb_idxs = indices[start_idx:end_idx]
-
 
                 _, newlogprobs, entropy = self.actor(rollout["obs"][mb_idxs], rollout["actions"][mb_idxs])
                 newvalue = self.critic(rollout["obs"][mb_idxs])
@@ -305,7 +384,7 @@ class PPO:
 
                 mb_advantages = advantages[mb_idxs]
 
-                # Polivy update
+                # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
@@ -320,11 +399,10 @@ class PPO:
                     )
                     v_loss_clipped = (v_clipped - b_returns[mb_idxs]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
+                    v_loss = v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_idxs]) ** 2).mean()
+                    v_loss = ((newvalue - b_returns[mb_idxs]) ** 2).mean()
 
-                # Entropy loss
                 entropy_loss = entropy.mean()
                 actor_loss = pg_loss - self.config.ent_coef * entropy_loss
                 critic_loss = v_loss * self.config.vf_coef
@@ -365,8 +443,16 @@ class PPO:
             mean_metrics[k] = np.mean([metrics[epoch][k] for epoch in range(self.config.n_epochs)])
         results.update(mean_metrics)
 
-        # TODO: add explained variance
-        # TODO: add KL divergence
+        # Debugging: approx KL (old vs new policy) and explained variance (value fit)
+        with torch.no_grad():
+            _, new_logprobs, _ = self.actor(rollout["obs"], rollout["actions"])
+            approx_kl = (rollout["logprobs"] - new_logprobs).mean().item()
+            new_values = self.critic(rollout["obs"])
+            var_returns = b_returns.var().item() + 1e-8
+            explained_var = (1.0 - (b_returns - new_values).var().item() / var_returns)
+
+        results["approx_kl"] = approx_kl
+        results["explained_variance"] = explained_var
         return results
 
     def save(
@@ -394,6 +480,8 @@ class PPO:
         if include_optimizers:
             payload["actor_optimizer_state_dict"] = self.actor_optimizer.state_dict()
             payload["critic_optimizer_state_dict"] = self.critic_optimizer.state_dict()
+        if self.obs_rms is not None:
+            payload["obs_rms"] = self.obs_rms.state_dict()
         if epoch is not None:
             payload["epoch"] = epoch
         payload.update(extra)
@@ -424,6 +512,8 @@ class PPO:
             self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
         if load_optimizers and "critic_optimizer_state_dict" in payload:
             self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+        if self.obs_rms is not None and "obs_rms" in payload:
+            self.obs_rms.load_state_dict(payload["obs_rms"])
 
         return payload
 
@@ -464,6 +554,8 @@ class PPO:
             agent.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
         if "critic_optimizer_state_dict" in payload:
             agent.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+        if agent.obs_rms is not None and "obs_rms" in payload:
+            agent.obs_rms.load_state_dict(payload["obs_rms"])
         return agent, payload
 
 
@@ -486,20 +578,27 @@ if __name__ == "__main__":
             config=asdict(config)
         )
 
-    env = make_env(
+    num_envs = config.env.num_envs
+    T = config.batch_size  # horizon (steps per env per rollout)
+
+    _is_mjx = config.env.domain_name.lower().startswith("mjx/")
+    envs = make_vec_env(
         env_id=config.env.domain_name,
         task=config.env.task,
-        seed=config.env.seed, # NB: keep env seed fixed, change only algo seed
+        seed=config.env.seed,
+        num_envs=num_envs,
+        torch_device=config.device if _is_mjx else None,
     )
 
-    s_dim, a_dim, discrete = get_env_dims(env)
+    s_dim, a_dim, discrete = get_env_dims(envs)
     config.s_dim = s_dim
     config.a_dim = a_dim
 
     config.discrete_actions = discrete
     if not discrete:
-        config.action_low = env.action_space.low
-        config.action_high = env.action_space.high
+        act_space = envs.single_action_space
+        config.action_low = act_space.low
+        config.action_high = act_space.high
         print(f"action_low: {config.action_low}, action_high: {config.action_high}")
 
     if config.load_checkpoint:
@@ -517,81 +616,147 @@ if __name__ == "__main__":
         base_dir=config.save_dir,
     )
 
-    obs_buffer = torch.zeros((config.batch_size, s_dim)).to(config.device)
+    # Buffers: (T, N, ...) where T = horizon, N = num_envs
+    obs_buffer = torch.zeros((T, num_envs, s_dim), device=config.device)
     actions_buffer = (
-        torch.zeros((config.batch_size,), dtype=torch.long).to(config.device)
+        torch.zeros((T, num_envs), dtype=torch.long, device=config.device)
         if config.discrete_actions
-        else torch.zeros((config.batch_size, a_dim)).to(config.device)
+        else torch.zeros((T, num_envs, a_dim), device=config.device)
     )
-    logprobs_buffer = torch.zeros((config.batch_size)).to(config.device)
-    rewards_buffer = torch.zeros((config.batch_size)).to(config.device)
-    dones_buffer = torch.zeros((config.batch_size)).to(config.device)
-    values_buffer = torch.zeros((config.batch_size + 1)).to(config.device)
+    logprobs_buffer = torch.zeros((T, num_envs), device=config.device)
+    rewards_buffer = torch.zeros((T, num_envs), device=config.device)
+    dones_buffer = torch.zeros((T, num_envs), device=config.device)
+    values_buffer = torch.zeros((T + 1, num_envs), device=config.device)
 
-    step = 0
+    total_batch = T * num_envs
+    num_updates = config.n_steps // total_batch
+
     episode_idx = 0
-    episode_len = 0
-    episode_rew = 0.0
-    rewards = deque(maxlen=config.window_size)  # last N step rewards
+    episode_returns = np.zeros(num_envs, dtype=np.float64)
+    episode_lengths = np.zeros(num_envs, dtype=np.int64)
+    recent_ep_returns = deque(maxlen=config.window_size)
+    global_step = 0
 
-    obs, info = env.reset()
+    obs, info = envs.reset()  # (N, s_dim)
 
-    for t in tqdm(range(config.n_steps)):
-        with torch.no_grad():
+    pbar = tqdm(total=config.n_steps, desc="PPO Training")
 
-            obs_tensor = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
-            action, logprob, entropy, value = agent.act(obs_tensor, values=True)
-            if config.discrete_actions:
-                a_env = int(action.item())
-            else:
-                a_env = action.cpu().numpy()[0]
-            next_obs, reward, terminated, truncated, info = env.step(a_env)
-
-            obs_buffer[step] = obs_tensor.squeeze(0)
-            actions_buffer[step] = action.squeeze(0)
-            logprobs_buffer[step] = logprob.squeeze(0)
-            rewards_buffer[step] = reward
-            dones_buffer[step] = terminated #or truncated # Dones computed only with termination signal
-            values_buffer[step] = value.squeeze(0)
-
-            obs = next_obs
-            step += 1
-            rewards.append(reward)
-            episode_rew += reward
-            episode_len += 1
-
-            if terminated or truncated:
-                episode_idx += 1
-                if config.use_wandb:
-                    wandb.log({"metrics/reward_per_episode": episode_rew}, step=t)
-                    wandb.log({"metrics/episode_length": episode_len}, step=t)
-                episode_rew = 0.0
-                episode_len = 0
-                obs, _ = env.reset()
-
-        if step == config.batch_size:
+    for update_idx in range(num_updates):
+        for step in range(T):
             with torch.no_grad():
-                obs_T = torch.as_tensor(obs, device=config.device, dtype=torch.float32).unsqueeze(0)
-                values_buffer[step] = agent.critic(obs_T).squeeze(0)
-            rollout = {
-                "obs": obs_buffer,
-                "actions": actions_buffer,
-                "logprobs": logprobs_buffer,
-                "rewards": rewards_buffer,
-                "dones": dones_buffer,
-                "values": values_buffer,
-            }
-            metrics = agent.update(rollout)
-            if config.use_wandb:
-                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=t)
-            step = 0
+                obs_norm = agent.normalize_obs(obs, update=True)
+                obs_tensor = (
+                    obs_norm if isinstance(obs_norm, torch.Tensor)
+                    else torch.as_tensor(obs_norm, device=config.device, dtype=torch.float32)
+                )
+                action, logprob, entropy, value = agent.act(obs_tensor, values=True)
 
-        if config.save_every_steps and (t + 1) % config.save_every_steps == 0:
-            # TODO: rename epoch to step
-            agent.save(checkpoint_dir, epoch=t + 1)
+                if config.discrete_actions:
+                    a_env = action.cpu().numpy().astype(int)
+                elif _is_mjx:
+                    a_env = action
+                else:
+                    a_env = action.cpu().numpy()
 
-        if config.log_freq and (t + 1) % config.log_freq == 0 and rewards:
-            mean_reward = sum(rewards) / len(rewards)
-            wandb.log({f"metrics/reward_mean_last_{config.window_size}_steps": mean_reward}, step=t)
+                next_obs, reward, terminated, truncated, info = envs.step(a_env)
 
-    agent.save(checkpoint_dir, epoch=config.n_steps)
+                if not isinstance(reward, torch.Tensor):
+                    reward = torch.as_tensor(np.asarray(reward, dtype=np.float32), device=config.device)
+                    terminated = torch.as_tensor(np.asarray(terminated), device=config.device)
+                    truncated = torch.as_tensor(np.asarray(truncated), device=config.device)
+                done = (terminated | truncated)
+
+                obs_buffer[step] = obs_tensor
+                actions_buffer[step] = action
+                logprobs_buffer[step] = logprob
+                rewards_buffer[step] = reward.float()
+                dones_buffer[step] = done.float()
+                values_buffer[step] = value
+
+                reward_np = reward.detach().cpu().numpy()
+                done_np = done.detach().cpu().numpy()
+                episode_returns += reward_np
+                episode_lengths += 1
+
+                # Log episode stats: from env info (CleanRL-style) when available, else from our accumulation
+                if "episode" in info and "_episode" in info:
+                    _ep, _r, _l = info["_episode"], info["episode"]["r"], info["episode"]["l"]
+                    if torch.is_tensor(_ep):
+                        ep_done = _ep.cpu().numpy().reshape(num_envs)
+                        ep_r = _r.cpu().numpy().reshape(num_envs)
+                        ep_l = _l.cpu().numpy().reshape(num_envs)
+                    else:
+                        ep_done = np.asarray(_ep).reshape(num_envs)
+                        ep_r = np.asarray(_r).reshape(num_envs)
+                        ep_l = np.asarray(_l).reshape(num_envs)
+                    for i in np.where(ep_done)[0]:
+                        episode_idx += 1
+                        recent_ep_returns.append(float(ep_r[i]))
+                        if config.use_wandb:
+                            wandb.log(
+                                {"metrics/reward_per_episode": float(ep_r[i]), "metrics/episode_length": int(ep_l[i])},
+                                step=global_step,
+                                commit=False,
+                            )
+                else:
+                    for i in range(num_envs):
+                        if done_np[i]:
+                            episode_idx += 1
+                            recent_ep_returns.append(episode_returns[i])
+                            if config.use_wandb:
+                                wandb.log(
+                                    {
+                                        "metrics/reward_per_episode": episode_returns[i],
+                                        "metrics/episode_length": episode_lengths[i],
+                                    },
+                                    step=global_step,
+                                    commit=False,
+                                )
+                            episode_returns[i] = 0.0
+                            episode_lengths[i] = 0
+
+                obs = next_obs
+                global_step += num_envs
+                pbar.update(num_envs)
+
+        # Bootstrap value for the last observation in each env
+        with torch.no_grad():
+            obs_norm = agent.normalize_obs(obs, update=False)
+            obs_tensor = (
+                obs_norm if isinstance(obs_norm, torch.Tensor)
+                else torch.as_tensor(obs_norm, device=config.device, dtype=torch.float32)
+            )
+            values_buffer[T] = agent.critic(obs_tensor)
+
+        # Compute GAE on (T, N) shaped tensors
+        advantages = agent.gae(
+            rewards_buffer.to(config.device),
+            values_buffer.to(config.device),
+            dones_buffer.to(config.device),
+        )
+        returns = advantages + values_buffer[:-1]
+
+        # Flatten (T, N, ...) -> (T*N, ...) for mini-batch SGD
+        rollout = {
+            "obs": obs_buffer.reshape(total_batch, s_dim),
+            "actions": actions_buffer.reshape(total_batch) if config.discrete_actions else actions_buffer.reshape(total_batch, a_dim),
+            "logprobs": logprobs_buffer.reshape(total_batch),
+            "values": values_buffer[:-1].reshape(total_batch),
+            "advantages": advantages.reshape(total_batch),
+            "returns": returns.reshape(total_batch),
+        }
+        metrics = agent.update(rollout)
+
+        if config.use_wandb:
+            log_dict = {f"train/{k}": v for k, v in metrics.items()}
+            if config.log_freq and recent_ep_returns:
+                log_dict[f"metrics/mean_ep_return_last_{config.window_size}"] = (
+                    sum(recent_ep_returns) / len(recent_ep_returns)
+                )
+            wandb.log(log_dict, step=global_step, commit=True)
+
+        if config.save_every_steps and global_step >= config.save_every_steps and global_step % config.save_every_steps < total_batch:
+            agent.save(checkpoint_dir, epoch=global_step)
+
+    pbar.close()
+    agent.save(checkpoint_dir, epoch=global_step)

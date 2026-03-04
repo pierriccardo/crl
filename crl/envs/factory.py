@@ -1,12 +1,19 @@
 import gymnasium as gym
+try:
+    from gymnasium.wrappers.vector import RecordEpisodeStatistics as GymRecordEpisodeStatistics
+except ImportError:
+    from gymnasium.wrappers.vector.common import RecordEpisodeStatistics as GymRecordEpisodeStatistics
 
 # Envs dependencies
 from minigrid.core.actions import Actions
-from metaworld.env_dict import ALL_V3_ENVIRONMENTS
-import metaworld
 
 # Environments, adapters and wrappers
 from crl.envs.adapters import MultiTaskGridEnv
+from crl.envs.continualworld import (
+    cw10_v3,
+    cw20_v3,
+    make_continualworld_env,
+)
 from crl.envs.tasks import (
     MJX_TASKS_SPECS,
     MJX_SCENARIO_SEQUENCES,
@@ -18,9 +25,9 @@ from crl.envs.wrappers import (
     ImageWrapper,
     HighwayParkingDistWrapper,
     VectorizeObsWrapper,
-    BraxTaskTransformWrapper,
-    MjxGymnasiumWrapper,
+    RecordEpisodeStatistics as CustomRecordEpisodeStatistics,
 )
+from crl.envs.mjx_playground_wrapper import MjxPlaygroundGymWrapper, MjxPlaygroundStdWrapper
 
 from typing import Callable, Dict, Optional
 
@@ -65,12 +72,7 @@ def _multitaskgrid_env(task: str = "reachgreen", seed: int = 0, max_episode_step
 
 @_register("continualworld")
 def _continualworld_env(task: str = "hammer-v3", seed: int = 0, max_episode_steps: int = 1000) -> gym.Env:
-    if task not in ALL_V3_ENVIRONMENTS:
-        raise ValueError(f"Unknown ContinualWorld task {task!r}. Known: {', '.join(sorted(ALL_V3_ENVIRONMENTS))}")
-    benchmark = metaworld.MT1(task, seed=seed)
-    env = ALL_V3_ENVIRONMENTS[task]()
-    env.set_task(benchmark.train_tasks[0])
-    return env
+    return make_continualworld_env(task=task, seed=seed, max_episode_steps=max_episode_steps)
 
 
 @_register("highway_parking")
@@ -93,27 +95,32 @@ def _highway_parking_env(task: str = "park:0", seed: int = 0, max_episode_steps:
 
 
 
-@_register("mjx")
-def _mjx_env(env_id: str, task: str = "run", seed: int = 0, max_episode_steps: int = 1000) -> gym.Env:
-    try:
-        import mujoco_playground
-        from mujoco import mjx as mujoco_mjx
-    except ImportError as e:
-        raise ImportError("MJX support requires `mujoco_playground`. Try: pip install playground") from e
+def _resolve_mjx_task(env_id: str, task: str) -> dict:
+    """Resolve MJX domain + task to the task_spec dict.
 
-    import numpy as np
-
+    Raises ValueError for unknown domains or tasks.
+    """
     domain = env_id.split("/", 1)[1].lower()
     if domain not in MJX_TASKS_SPECS:
         raise ValueError(f"Unknown MJX domain {domain!r}. Known: {', '.join(sorted(MJX_TASKS_SPECS))}")
     task_specs = MJX_TASKS_SPECS[domain]
     if task not in task_specs:
         raise ValueError(f"Unknown MJX task {task!r} for {domain!r}. Known: {', '.join(sorted(task_specs))}")
+    return dict(task_specs[task])
 
-    task_spec = dict(task_specs[task])
-    mjx_env = mujoco_playground.registry.load(task_spec["env_name"])
 
-    # Apply physics modifications directly on mj_model, then rebuild mjx model
+def _apply_physics_overrides(mjx_env, task_spec: dict) -> None:
+    """Mutate *mjx_env* model parameters in-place according to *task_spec*.
+
+    Must be called **before** the first ``jax.jit`` call so the JIT
+    compilation bakes in the modified model (``jax.jit`` is lazy).
+    """
+    import numpy as np
+    try:
+        from mujoco import mjx as mujoco_mjx
+    except ImportError as e:
+        raise ImportError("MJX support requires `mujoco`. Try: pip install mujoco") from e
+
     modified = False
     if "gravity" in task_spec:
         mjx_env._mj_model.opt.gravity[:] = np.array([0.0, 0.0, -9.81 * task_spec["gravity"]])
@@ -124,9 +131,24 @@ def _mjx_env(env_id: str, task: str = "run", seed: int = 0, max_episode_steps: i
     if modified:
         mjx_env._mjx_model = mujoco_mjx.put_model(mjx_env._mj_model)
 
-    env = MjxGymnasiumWrapper(mjx_env, seed=seed, max_episode_steps=max_episode_steps)
-    env = BraxTaskTransformWrapper(env=env, task_name=task, task_spec=task_spec)
-    return env
+
+@_register("mjx")
+def _mjx_env(env_id: str, task: str = "run", seed: int = 0, max_episode_steps: int = 1000) -> gym.Env:
+    task_spec = _resolve_mjx_task(env_id, task)
+    env = MjxPlaygroundGymWrapper(
+        env_name=task_spec["env_name"],
+        num_envs=1,
+        seed=seed,
+        device="cpu",
+        max_episode_steps=max_episode_steps,
+    )
+    _apply_physics_overrides(env.env, task_spec)
+    return MjxPlaygroundStdWrapper(
+        env,
+        task_name=task,
+        action_coefficient=float(task_spec.get("action_coefficient", 1.0)),
+        action_mask=task_spec.get("action_mask"),
+    )
 
 
 # ============================================
@@ -154,38 +176,77 @@ for _env_name, _seqs in MJX_SCENARIO_SEQUENCES.items():
     _register_task_sequence(_env_name, "full", _all_tasks)
 
 # Continual World sequences (Meta-World task names)
-_register_task_sequence(
-    "continualworld",
-    "cw10",
-    [
-        "hammer-v3",
-        "push-wall-v3",
-        "faucet-close-v3",
-        "push-back-v3",
-        "stick-pull-v3",
-        "handle-press-side-v3",
-        "push-v3",
-        "shelf-place-v3",
-        "window-close-v3",
-        "peg-unplug-side-v3",
-    ],
-)
-_register_task_sequence("continualworld", "cw3_t1", ["push-v3", "window-close-v3", "hammer-v3"])
-_register_task_sequence("continualworld", "cw3_t2", ["hammer-v3", "window-close-v3", "faucet-close-v3"])
-_register_task_sequence(
-    "continualworld",
-    "cw3_t3",
-    ["window-close-v3", "handle-press-side-v3", "peg-unplug-side-v3"],
-)
-_register_task_sequence("continualworld", "cw3_t4", ["faucet-close-v3", "shelf-place-v3", "peg-unplug-side-v3"])
-_register_task_sequence("continualworld", "cw3_t5", ["faucet-close-v3", "shelf-place-v3", "push-back-v3"])
-_register_task_sequence("continualworld", "cw3_t6", ["stick-pull-v3", "peg-unplug-side-v3", "stick-pull-v3"])
-_register_task_sequence("continualworld", "cw3_t7", ["stick-pull-v3", "push-back-v3", "push-wall-v3"])
-_register_task_sequence("continualworld", "cw3_t8", ["push-wall-v3", "shelf-place-v3", "push-back-v3"])
+_CW10_V3 = cw10_v3()
+_CW20_V3 = cw20_v3()
+_register_task_sequence("continualworld", "cw10", _CW10_V3)
+_register_task_sequence("continualworld", "cw20", _CW20_V3)
 
 # ============================================
 # Exposed public methods
 # ============================================
+
+
+def make_vec_env(
+    env_id: str,
+    task: str = "default",
+    seed: int = 0,
+    max_episode_steps: int = 1000,
+    num_envs: int = 4,
+    mode: str = "sync",
+    torch_device: Optional[str] = None,
+):
+    """Create multiple parallel environments.
+
+    For **MJX** environments this returns a :class:`MjxPlaygroundStdWrapper`
+    wrapping :class:`MjxPlaygroundGymWrapper` with ``jax.vmap`` for native
+    GPU batching -- a single JIT compilation runs all *N* envs in one
+    kernel (the ``mode`` argument is ignored).  The wrapper handles
+    auto-reset, ``final_observation`` storage, and per-task action transforms.
+
+    Pass ``torch_device`` (e.g. ``"cuda"``) to keep data on GPU and use
+    DLPack zero-copy transfers between JAX and PyTorch.  In this mode
+    ``step()`` accepts/returns **torch tensors** instead of numpy arrays.
+
+    For all other environments it falls back to Gymnasium's
+    ``SyncVectorEnv`` / ``AsyncVectorEnv`` (``torch_device`` is ignored).
+
+    Args:
+        env_id: Registry key, e.g. ``"mjx/cheetah"``, ``"continualworld"``.
+        task: Task name within the environment.
+        seed: Base random seed.
+        max_episode_steps: Episode length / horizon.
+        num_envs: Number of parallel environments.
+        mode: ``"sync"`` or ``"async"`` (non-MJX envs only).
+        torch_device: If set, MJX envs return torch tensors on this device.
+    """
+    if env_id.lower().startswith("mjx/"):
+        task_spec = _resolve_mjx_task(env_id, task)
+        device = torch_device or "cuda"
+        env = MjxPlaygroundGymWrapper(
+            env_name=task_spec["env_name"],
+            num_envs=num_envs,
+            seed=seed,
+            device=device,
+            max_episode_steps=max_episode_steps,
+        )
+        _apply_physics_overrides(env.env, task_spec)
+        wrapped = MjxPlaygroundStdWrapper(
+            env,
+            task_name=task,
+            action_coefficient=float(task_spec.get("action_coefficient", 1.0)),
+            action_mask=task_spec.get("action_mask"),
+        )
+        return CustomRecordEpisodeStatistics(wrapped)
+
+    def _make_fn(idx: int):
+        def _init() -> gym.Env:
+            return make_env(env_id, task=task, seed=seed + idx, max_episode_steps=max_episode_steps)
+        return _init
+
+    env_fns = [_make_fn(i) for i in range(num_envs)]
+    if mode == "async":
+        return GymRecordEpisodeStatistics(gym.vector.AsyncVectorEnv(env_fns))
+    return GymRecordEpisodeStatistics(gym.vector.SyncVectorEnv(env_fns))
 
 
 def make_env(

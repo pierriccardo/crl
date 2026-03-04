@@ -48,7 +48,7 @@ MJX_TASKS_SPECS = {
 MJX_SCENARIO_SEQUENCES = {
     "mjx/cheetah": {
         "forgetting":       ["hugegravity", "moon",     "rainfall",      "normal"],
-        "transfer":         ["moon",         "rainfall", "inverted_actions", "hugegravity"],
+        "transfer":        ["moon",         "rainfall", "inverted_actions", "hugegravity"],
         "robustness":       ["normal", "inverted_actions", "normal", "inverted_actions"],
         "compositionality": ["moon", "inverted_actions", "moon_inverted", "normal"],
     },
@@ -58,7 +58,8 @@ MJX_SCENARIO_SEQUENCES = {
     },
     "mjx/walker": {
         "forgetting":       ["run",        "hugegravity", "rainfall",   "moon"],
-        "transfer":         ["noleg_right", "noleg_left", "noknees",    "noankles"],
+        "transfer":         ["stand", "walk", "run",    "hugegravity"],
+        "transfer2":         ["noleg_right", "noleg_left", "noknees",    "noankles"],
         "robustness":       ["run", "inverted_actions",   "run",        "inverted_actions"],
         "compositionality": ["noleg_right", "noleg_left", "moon",       "rainfall"],
     },

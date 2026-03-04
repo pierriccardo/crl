@@ -1,3 +1,6 @@
+import jax
+import jax.numpy as jnp
+import torch
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -78,6 +81,65 @@ class FloatObsWrapper(gym.ObservationWrapper):
         return obs.astype(np.float32)
 
 
+class RecordEpisodeStatistics(gym.Wrapper):
+    """Episode stats in info ('episode', '_episode') for batched envs that are NOT gym.vector.VectorEnv.
+
+    Use this only when the env is a custom batched env (e.g. MJX) — a single gym.Env that
+    returns batched reward/done. For standard VectorEnv (SyncVectorEnv, AsyncVectorEnv) use
+    gymnasium.wrappers.vector.RecordEpisodeStatistics instead, which requires a VectorEnv.
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self._episode_return = None
+        self._episode_length = None
+        self.num_envs = getattr(env, "num_envs", 1)
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        if info is None:
+            info = {}
+        self._episode_return = np.zeros(self.num_envs, dtype=np.float64)
+        self._episode_length = np.zeros(self.num_envs, dtype=np.int32)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if info is None:
+            info = {}
+        if torch.is_tensor(reward):
+            dev = reward.device
+            r = reward.float().flatten()[: self.num_envs]
+            done = (terminated | truncated).flatten()[: self.num_envs]
+            if not torch.is_tensor(self._episode_return):
+                self._episode_return = torch.zeros(self.num_envs, device=dev, dtype=torch.float64)
+                self._episode_length = torch.zeros(self.num_envs, device=dev, dtype=torch.long)
+            self._episode_return = self._episode_return + r
+            self._episode_length = self._episode_length + 1
+            if done.any():
+                info["episode"] = {
+                    "r": torch.where(done, self._episode_return, torch.zeros_like(self._episode_return)),
+                    "l": torch.where(done, self._episode_length, torch.zeros_like(self._episode_length)),
+                }
+                info["_episode"] = done
+                self._episode_return = torch.where(done, torch.zeros_like(self._episode_return), self._episode_return)
+                self._episode_length = torch.where(done, torch.zeros_like(self._episode_length), self._episode_length)
+        else:
+            r = np.asarray(reward, dtype=np.float64).flatten()[: self.num_envs]
+            done = np.asarray(terminated | truncated).flatten()[: self.num_envs]
+            self._episode_return += r
+            self._episode_length += 1
+            if np.any(done):
+                info["episode"] = {
+                    "r": np.where(done, self._episode_return, np.zeros_like(self._episode_return)),
+                    "l": np.where(done, self._episode_length, np.zeros_like(self._episode_length)),
+                }
+                info["_episode"] = done
+                self._episode_return = np.where(done, 0.0, self._episode_return)
+                self._episode_length = np.where(done, 0, self._episode_length)
+        return obs, reward, terminated, truncated, info
+
+
 class ChannelStandardizationWrapper(gym.ObservationWrapper):
     """Wrapper that standardizes the number of channels across different environments."""
 
@@ -123,79 +185,6 @@ class ChannelStandardizationWrapper(gym.ObservationWrapper):
             else:
                 # Generic case: take first target_channels
                 return obs[:, :, :self.target_channels].astype(np.float32)
-
-
-class BraxTaskTransformWrapper(gym.Env):
-    """
-    Applies per-task action transforms (mask/inversion) and annotates task info.
-    This wrapper is task-static: one wrapped env instance corresponds to one task.
-
-    Inherits from gymnasium.Env (not gymnasium.Wrapper) so it can wrap the old-gym
-    brax TorchWrapper without triggering gymnasium's isinstance assertion.
-    Always exposes a gymnasium-compatible interface on the outside.
-    """
-
-    def __init__(self, env, task_name: str, task_spec: Optional[Dict[str, Any]] = None):
-        super().__init__()
-        self.env = env
-        self.action_space = env.action_space
-        self.observation_space = env.observation_space
-        self.task_name = str(task_name)
-        self.task_spec = dict(task_spec or {})
-        self._action_coefficient = float(self.task_spec.get("action_coefficient", 1.0))
-        self._action_mask = self.task_spec.get("action_mask")
-        if self._action_mask is not None:
-            self._action_mask = np.asarray(self._action_mask, dtype=np.float32)
-
-    def _transform_action(self, action):
-        try:
-            import torch
-            is_torch = isinstance(action, torch.Tensor)
-        except ImportError:
-            is_torch = False
-
-        a = np.asarray(action.detach().cpu() if is_torch else action, dtype=np.float32)
-        if self._action_mask is not None:
-            a = a * self._action_mask
-        a = self._action_coefficient * a
-        if isinstance(self.action_space, spaces.Box):
-            a = np.clip(a, self.action_space.low, self.action_space.high)
-
-        if is_torch:
-            return torch.tensor(a, dtype=torch.float32)
-        return a
-
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        # brax GymWrapper exposes seed() + no-arg reset; gymnasium uses reset(seed=...)
-        if seed is not None and hasattr(self.env, "seed"):
-            self.env.seed(seed)
-            result = self.env.reset()
-        else:
-            try:
-                result = self.env.reset(seed=seed, options=options)
-            except TypeError:
-                result = self.env.reset()
-
-        obs, info = (result if isinstance(result, tuple) else (result, {}))
-        info = dict(info or {})
-        info["task"] = self.task_name
-        return obs, info
-
-    def step(self, action):
-        result = self.env.step(self._transform_action(action))
-        if len(result) == 4:
-            obs, reward, done, info = result
-            terminated, truncated = bool(done), False
-        else:
-            obs, reward, terminated, truncated, info = result
-        info = dict(info or {})
-        info["task"] = self.task_name
-        return obs, reward, terminated, truncated, info
-
-    def close(self):
-        if hasattr(self.env, "close"):
-            self.env.close()
-
 
 class HighwayParkingDistWrapper(gym.Wrapper):
     """
@@ -418,62 +407,4 @@ class MetaworldTaskSwitcher(gym.Wrapper):
 
         return obs, info
 
-
-# ==================================================
-# MJX (mujoco_playground) gymnasium adapter
-# ==================================================
-
-class MjxGymnasiumWrapper(gym.Env):
-    """Wraps a mujoco_playground MjxEnv with a standard gymnasium interface.
-
-    MjxEnv API (pure JAX, stateful):
-        state = env.reset(rng: jax.Array)
-        state = env.step(state, action: jax.Array)
-
-    This wrapper stores the JAX state internally, JIT-compiles reset/step on
-    first call, and converts observations/actions between numpy and JAX.
-    """
-
-    def __init__(self, mjx_env, seed: int = 0, max_episode_steps: int = 1000):
-        import jax
-        super().__init__()
-        self._env = mjx_env
-        self._max_episode_steps = max_episode_steps
-        self._step_count = 0
-        self._state = None
-        self._key = jax.random.PRNGKey(seed)
-
-        # JIT-compile for speed (first call triggers compilation)
-        self._jit_reset = jax.jit(mjx_env.reset)
-        self._jit_step  = jax.jit(mjx_env.step)
-
-        action_size = mjx_env.action_size
-        obs_size    = mjx_env.observation_size
-        self.action_space      = spaces.Box(-1.0, 1.0, shape=(action_size,),  dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_size,), dtype=np.float32)
-
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
-        import jax
-        if seed is not None:
-            self._key = jax.random.PRNGKey(seed)
-        self._key, rng = jax.random.split(self._key)
-        self._state = self._jit_reset(rng)
-        self._step_count = 0
-        obs = np.asarray(self._state.obs, dtype=np.float32)
-        return obs, {}
-
-    def step(self, action) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        import jax.numpy as jnp
-        action_jax = jnp.asarray(action, dtype=jnp.float32)
-        self._state = self._jit_step(self._state, action_jax)
-        obs        = np.asarray(self._state.obs,    dtype=np.float32)
-        reward     = float(self._state.reward)
-        terminated = bool(self._state.done)
-        self._step_count += 1
-        truncated  = self._step_count >= self._max_episode_steps
-        info       = {k: float(v) for k, v in self._state.metrics.items()}
-        return obs, reward, terminated, truncated, info
-
-    def close(self):
-        pass
 

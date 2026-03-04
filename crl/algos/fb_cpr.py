@@ -26,11 +26,35 @@ from collections import deque
 from collections.abc import Mapping
 
 from crl.buffers import DictBuffer, ZBuffer, TrajectoryBuffer
-from crl.envs import EnvConfig, make_env, get_task_sequence, get_env_dims
+from crl.algos.continual_eval import ContinualMetricTracker, extract_success_from_info, obs_to_np_vector
+from crl.envs import EnvConfig, make_env, make_vec_env, get_task_sequence, get_env_dims
 
 print("cuda available:", torch.cuda.is_available())
 print("device count:", torch.cuda.device_count())
 print("current device:", torch.cuda.current_device() if torch.cuda.is_available() else None)
+
+
+def _extract_success_from_infos(infos, num_envs: int):
+    """Best-effort extraction of per-env success flags from vectorized infos."""
+    if not isinstance(infos, dict):
+        return None
+    for key in ("success", "is_success"):
+        if key not in infos:
+            continue
+        raw = infos[key]
+        if torch.is_tensor(raw):
+            arr = raw.detach().cpu().numpy()
+        else:
+            arr = np.asarray(raw)
+        arr = np.asarray(arr).reshape(-1)
+        if arr.size < num_envs:
+            continue
+        try:
+            return arr[:num_envs].astype(np.float32) > 0.0
+        except Exception:
+            return arr[:num_envs].astype(bool)
+    return None
+
 
 # ==================================================
 # Configs
@@ -165,13 +189,12 @@ class Config:
     seed: int = 0
     num_steps: int = 0  # total train steps (0 => len(task_list)*env.steps_per_task)
     buffer_size: int = 100_000
-    expert_buffer_size: int = 1000
-    expert_buffer_max: int = 100  # Keep only top N episodes by reward on the expert
-    warmup_steps: int = 2_000  # steps before first update (was 20k; too many random trajectories)
+    expert_buffer_size: int = 1000  # Max expert trajectories; add new only if return > worst in buffer
+    warmup_steps: int = 2_000  # steps before first update
 
     train_freq_steps: int = 1000  # gradient update every N env steps
 
-    z_inference_freq: int = 256    # re-infer task latent every N steps; 0 = once per episode
+    z_inference_freq: int = 1    # re-infer task latent every N steps; 0 = once per episode
     z_inference_samples: int = 10_000  # number of (next_obs, reward) pairs fed to reward_inference
     temperature: float = 0.1 # Temp for discrete action policy
 
@@ -184,7 +207,7 @@ class Config:
     use_wandb: bool = True
     algo_name: str = "OnlineFBcpr"
     proj_name: str = "continual-rl"
-    log_freq: int = 100
+    log_freq: int = 1000
 
 
 
@@ -1762,7 +1785,7 @@ class FBcprAgent(FBAgent):
         return output_metrics
 
 
-def eval(agent, config):
+def eval(agent, config, log_to_wandb: bool = True):
 
     task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
     print(f"task list on eval: {task_list}")
@@ -1784,13 +1807,13 @@ def eval(agent, config):
         num_collected = 0
 
         obs, _ = eval_env.reset()
-        obs = np.asarray(obs, dtype=np.float32)
+        obs = obs_to_np_vector(obs)
         terminated = truncated = False
 
         while num_collected < config.z_inference_samples:
             if terminated or truncated:
                 obs, _ = eval_env.reset()
-                obs = np.asarray(obs, dtype=np.float32)
+                obs = obs_to_np_vector(obs)
 
             # Sample uniform random action
             if hasattr(action_space, 'sample'):
@@ -1804,9 +1827,9 @@ def eval(agent, config):
                 ).astype(action_space.dtype)
 
             next_obs, reward, terminated, truncated, info = eval_env.step(action)
-            next_obs = np.asarray(next_obs, dtype=np.float32)
+            next_obs = obs_to_np_vector(next_obs)
             next_obs_list.append(next_obs)
-            rewards_list.append(reward)
+            rewards_list.append(float(np.asarray(reward, dtype=np.float32).reshape(-1)[0]))
             num_collected += 1
 
             obs = next_obs
@@ -1827,17 +1850,24 @@ def eval(agent, config):
     # --------------------------------------------------
     # Evaluate each inferred z
     # --------------------------------------------------
+    reward_means: list[float] = []
+    success_means: list[float] = []
+
     for task in task_list:
         z = torch.tensor(task_zs[task], device=agent.device).reshape(1, -1)
         # TODO: double env creation, fix
         eval_env = make_env(env_id=config.env.domain_name, task=task)
 
         total_reward = np.zeros((config.num_eval_episodes,), dtype=np.float32)
+        episode_successes: list[float] = []
+        saw_success_signal = False
         for ep in range(config.num_eval_episodes):
             obs, _ = eval_env.reset()
-            obs = np.asarray(obs, dtype=np.float32)
+            obs = obs_to_np_vector(obs)
 
             terminated = truncated = False
+            ep_success = False
+            ep_had_success_signal = False
             while not (terminated or truncated):
                 with torch.no_grad(), eval_mode(agent._model):
                     obs_tensor = torch.as_tensor(obs, device=agent.device, dtype=torch.float32)
@@ -1847,18 +1877,34 @@ def eval(agent, config):
 
                 action_env = discretize_action_for_env(action, eval_env.action_space)
                 next_obs, reward, terminated, truncated, info = eval_env.step(action_env)
-                next_obs = np.asarray(next_obs, dtype=np.float32)
-                total_reward[ep] += reward
+                success = extract_success_from_info(info)
+                if success is not None:
+                    ep_had_success_signal = True
+                    ep_success = ep_success or (success > 0)
+                next_obs = obs_to_np_vector(next_obs)
+                total_reward[ep] += float(np.asarray(reward, dtype=np.float32).reshape(-1)[0])
                 obs = next_obs
+            if ep_had_success_signal:
+                saw_success_signal = True
+                episode_successes.append(float(ep_success))
 
         mean_r = float(np.mean(total_reward))
         std_r = float(np.std(total_reward))
+        reward_means.append(mean_r)
+        if saw_success_signal:
+            success_means.append(float(np.mean(episode_successes)))
+        else:
+            success_means.append(float("nan"))
 
-        if config.use_wandb:
+        if config.use_wandb and log_to_wandb:
             wandb.log({
                 f"eval/{task}/reward_mean": mean_r,
                 f"eval/{task}/reward_std": std_r,
             })
+            if saw_success_signal:
+                wandb.log({f"eval/{task}/success_mean": float(np.mean(episode_successes))})
+
+    return np.asarray(reward_means, dtype=np.float32), np.asarray(success_means, dtype=np.float32)
 
 
 if __name__ == "__main__":
@@ -1876,14 +1922,19 @@ if __name__ == "__main__":
     task_list = get_task_sequence(config.env.domain_name, config.env.task_list)
     print(f"task list on main: {task_list}")
 
-    env = make_env(
+    num_envs = config.env.num_envs
+
+    # Create initial env to get dims (always single for dim extraction)
+    _tmp_env = make_env(
         env_id=config.env.domain_name,
         task=task_list[0],
         max_episode_steps=config.env.max_episode_steps,
-        seed=config.env.seed,  # keep env seed fixed, change only algo seed
+        seed=config.env.seed,
     )
+    obs_dim, action_dim, discrete = get_env_dims(_tmp_env)
+    _action_space = _tmp_env.action_space
+    _tmp_env.close()
 
-    obs_dim, action_dim, discrete = get_env_dims(env)
     config.model.obs_dim = obs_dim
     config.model.action_dim = action_dim
 
@@ -1898,171 +1949,283 @@ if __name__ == "__main__":
         ),
     }
 
-
     expert_rewards = {}
     expert_data = {}
+    expert_min_return = float('inf')
 
     global_step = 0
+    # Thresholds so train/eval/log trigger every N env steps even when global_step += num_envs
+    next_train_step = 0
+    next_z_infer_step = 0
     episode_idx = 0
     total_steps = len(task_list) * config.env.steps_per_task
 
     pbar = tqdm(total=total_steps, desc="Training", unit="step", dynamic_ncols=True)
+    reward_tracker: ContinualMetricTracker | None = None
+    success_tracker: ContinualMetricTracker | None = None
+    has_success_eval = False
+
+    if config.do_eval:
+        reward_tracker = ContinualMetricTracker(num_tasks=len(task_list), name="reward")
+        success_tracker = ContinualMetricTracker(num_tasks=len(task_list), name="success")
+        base_rewards, base_success = eval(agent, config, log_to_wandb=False)
+        reward_tracker.set_baseline(base_rewards)
+        if not np.all(np.isnan(base_success)):
+            success_tracker.set_baseline(base_success)
+            has_success_eval = True
 
     for task_idx, current_task in enumerate(task_list):
 
-        env = make_env(
+        print(f"\n[Task {task_idx+1}/{len(task_list)}] Starting task '{current_task}' at global_step={global_step}")
+        _use_torch_env = config.env.domain_name.lower().startswith("mjx/") and not discrete
+        envs = make_vec_env(
             env_id=config.env.domain_name,
             task=current_task,
             max_episode_steps=config.env.max_episode_steps,
             seed=config.env.seed,
+            num_envs=num_envs,
+            torch_device=config.model.device if _use_torch_env else None,
         )
 
-        obs, _ = env.reset()
-        terminated = truncated = False
-        episode_return = 0.0
+        obs, _ = envs.reset()  # torch tensor (MJX GPU) or numpy
         last_n_rewards = deque(maxlen=100)
-        episode_steps = 0
-        obs_list, z_list, action_list, reward_list, next_obs_list, done_list = [], [], [], [], [], []
-        # dedicated rolling buffers for z inference (O(1) append/evict via deque)
+        episode_success = np.zeros(num_envs, dtype=bool)
+        has_success_signal = False
+
+        # Per-env episode tracking
+        env_ep = [
+            {"obs": [], "z": [], "action": [], "reward": [], "next_obs": [], "done": []}
+            for _ in range(num_envs)
+        ]
         z_infer_next_obs: deque = deque(maxlen=config.z_inference_samples)
         z_infer_rewards: deque = deque(maxlen=config.z_inference_samples)
-        # task latent: start random, then re-inferred every z_inference_freq steps (or per episode)
-        z = agent._model.sample_z(1, device=agent.device)
 
-        for task_step in range(config.env.steps_per_task):
+        z = agent._model.sample_z(num_envs, device=agent.device)  # (N, z_dim)
+        z_np = z.detach().cpu().numpy()
 
-            # --- eval ---
-            if config.do_eval and global_step > 0 and global_step % config.eval_freq_steps == 0:
-                eval(agent, config, global_step)
+        steps_per_task = config.env.steps_per_task
+        num_step_iters = math.ceil(steps_per_task / num_envs)
+
+        for _ in range(num_step_iters):
 
             # --- train ---
             if (
-                global_step % config.train_freq_steps == 0
+                global_step >= next_train_step
                 and len(replay_buffer["train"]) >= config.train.batch_size
+                and not replay_buffer["expert_slicer"].empty()
                 and global_step >= config.warmup_steps
             ):
                 metrics = agent.update(replay_buffer, global_step)
                 if config.use_wandb:
                     wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=global_step)
+                next_train_step = global_step + config.train_freq_steps
 
-            # --- task latent inference ---
+            # --- task latent inference (shared across envs) ---
             if (
                 config.z_inference_freq > 0
-                and global_step % config.z_inference_freq == 0
+                and global_step >= next_z_infer_step
                 and len(z_infer_next_obs) > 0
             ):
-                next_obs_t = torch.as_tensor(
-                    np.concatenate(z_infer_next_obs, axis=0),
-                    device=agent.device, dtype=torch.float32,
-                )
-                reward_t = torch.as_tensor(
-                    z_infer_rewards, device=agent.device, dtype=torch.float32
+                next_obs_t = torch.from_numpy(
+                    np.concatenate(list(z_infer_next_obs), axis=0),
+                ).to(device=agent.device, dtype=torch.float32)
+                reward_t = torch.tensor(
+                    list(z_infer_rewards), device=agent.device, dtype=torch.float32
                 ).unsqueeze(1)
-                z = agent._model.reward_inference(next_obs=next_obs_t, reward=reward_t)
+                z_inferred = agent._model.reward_inference(next_obs=next_obs_t, reward=reward_t)
+                z = z_inferred.expand(num_envs, -1)
+                z_np = z.detach().cpu().numpy()
+                next_z_infer_step = global_step + config.z_inference_freq
 
-            # --- select action ---
-            action_tensor = agent.act(
-                torch.as_tensor(obs, device=agent.device, dtype=torch.float32).unsqueeze(0),
-                z,
-                mean=False,
-            )
-            action = action_tensor.cpu().numpy()[0]
-            action_env = discretize_action_for_env(action, env.action_space, temperature=config.temperature)
+            # --- select action for all envs ---
+            obs_tensor = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs, device=agent.device, dtype=torch.float32)
+            action_tensor = agent.act(obs_tensor, z, mean=False)  # (N, a_dim)
 
-            # --- env step ---
-            next_obs, reward, terminated, truncated, _ = env.step(action_env)
+            if discrete:
+                actions_np = action_tensor.detach().cpu().numpy()
+                actions_env = np.array([
+                    discretize_action_for_env(actions_np[i], _action_space, temperature=config.temperature)
+                    for i in range(num_envs)
+                ])
+            elif _use_torch_env:
+                actions_env = action_tensor
+            else:
+                actions_env = action_tensor.detach().cpu().numpy()
 
-            episode_steps += 1
-            if episode_steps >= config.env.max_episode_steps:
-                truncated = True
+            # --- env step (all envs) ---
+            next_obs, rewards, terminated, truncated, infos = envs.step(actions_env)
 
-            episode_return += reward
-            last_n_rewards.append(reward)
-            global_step += 1
-            if global_step % 10 == 0:
-                pbar.update(10)
+            # Batch-convert to numpy for storage (single GPU sync point)
+            obs_np = obs_tensor.detach().cpu().numpy()
+            actions_np = action_tensor.detach().cpu().numpy()
+            if isinstance(next_obs, torch.Tensor):
+                next_obs_np = next_obs.detach().cpu().numpy()
+                rewards_np = rewards.cpu().numpy()
+                terminated_np = terminated.cpu().numpy().astype(bool)
+                truncated_np = truncated.cpu().numpy().astype(bool)
+            else:
+                next_obs_np = np.asarray(next_obs, dtype=np.float32)
+                rewards_np = np.asarray(rewards, dtype=np.float32)
+                terminated_np = np.asarray(terminated, dtype=bool)
+                truncated_np = np.asarray(truncated, dtype=bool)
+            done = terminated_np | truncated_np
 
-            obs_list.append(obs.reshape(1, -1))
-            z_list.append(z.cpu().reshape(1, -1))
-            action_list.append(action.reshape(1, -1))
-            next_obs_list.append(next_obs.reshape(1, -1))
-            done_list.append(terminated)
-            reward_list.append(reward)
+            last_n_rewards.extend(rewards_np.tolist())
+            global_step += num_envs
+            pbar.update(num_envs)
 
-            z_infer_next_obs.append(next_obs.reshape(1, -1))
-            z_infer_rewards.append(reward)
+            # Use final_observation for done envs (VectorEnv auto-resets)
+            real_next_obs_np = next_obs_np.copy()
+            if "final_observation" in infos:
+                for i in range(num_envs):
+                    fo = infos["final_observation"][i]
+                    if done[i] and fo is not None:
+                        real_next_obs_np[i] = fo.detach().cpu().numpy() if isinstance(fo, torch.Tensor) else fo
+            info_ep_mask = np.zeros(num_envs, dtype=bool)
+            info_ep_returns = np.zeros(num_envs, dtype=np.float32)
+            info_ep_lengths = np.zeros(num_envs, dtype=np.float32)
+            if "episode" in infos and "_episode" in infos:
+                raw_ep_mask = infos["_episode"]
+                raw_ep_returns = infos["episode"]["r"]
+                raw_ep_lengths = infos["episode"]["l"]
+                info_ep_mask = (
+                    raw_ep_mask.detach().cpu().numpy().astype(bool)
+                    if torch.is_tensor(raw_ep_mask)
+                    else np.asarray(raw_ep_mask, dtype=bool)
+                ).reshape(-1)
+                info_ep_returns = (
+                    raw_ep_returns.detach().cpu().numpy().astype(np.float32)
+                    if torch.is_tensor(raw_ep_returns)
+                    else np.asarray(raw_ep_returns, dtype=np.float32)
+                ).reshape(-1)
+                info_ep_lengths = (
+                    raw_ep_lengths.detach().cpu().numpy().astype(np.float32)
+                    if torch.is_tensor(raw_ep_lengths)
+                    else np.asarray(raw_ep_lengths, dtype=np.float32)
+                ).reshape(-1)
+            success_flags = _extract_success_from_infos(infos, num_envs)
+            if success_flags is not None:
+                has_success_signal = True
+                episode_success |= success_flags
+
+            # Store transitions immediately in train buffer (don't wait for episode end)
+            train_transition = {
+                "observation": obs_np.astype(np.float32),
+                "action": actions_np.astype(np.float32),
+                "z": z_np.astype(np.float32),
+                "reward": rewards_np.astype(np.float32).reshape(num_envs, 1),
+                "next": {
+                    "observation": real_next_obs_np.astype(np.float32),
+                    "terminated": terminated_np.reshape(num_envs, 1),
+                },
+            }
+            replay_buffer["train"].extend(train_transition)
+
+            z_infer_next_obs.extend(real_next_obs_np[i].reshape(1, -1) for i in range(num_envs))
+            z_infer_rewards.extend(rewards_np.tolist())
+
+            # Handle episode boundaries (expert buffer + logging)
+            step_ep_returns = []
+            step_ep_lengths = []
+            step_ep_success = []
+            expert_dirty = False
+            for i in range(num_envs):
+                env_ep[i]["obs"].append(obs_np[i].reshape(1, -1))
+                env_ep[i]["z"].append(z_np[i:i+1])
+                env_ep[i]["action"].append(actions_np[i].reshape(1, -1))
+                env_ep[i]["reward"].append(rewards_np[i])
+                env_ep[i]["next_obs"].append(real_next_obs_np[i].reshape(1, -1))
+                env_ep[i]["done"].append(terminated_np[i])
+
+                if info_ep_mask[i]:
+                    ep_len = len(env_ep[i]["obs"])
+                    episode_dict = {
+                        "observation": np.concatenate(env_ep[i]["obs"], axis=0).astype(np.float32),
+                        "action": np.concatenate(env_ep[i]["action"], axis=0).astype(np.float32),
+                        "z": np.concatenate(env_ep[i]["z"], axis=0).astype(np.float32),
+                        "reward": np.asarray(env_ep[i]["reward"], dtype=np.float32).reshape(ep_len, 1),
+                        "next": {
+                            "observation": np.concatenate(env_ep[i]["next_obs"], axis=0).astype(np.float32),
+                            "terminated": np.asarray(env_ep[i]["done"], dtype=np.bool_).reshape(ep_len, 1),
+                        },
+                    }
+
+                    ep_return = float(info_ep_returns[i])
+                    ep_length = float(info_ep_lengths[i])
+                    step_ep_returns.append(ep_return)
+                    step_ep_lengths.append(ep_length)
+                    if has_success_signal:
+                        step_ep_success.append(float(episode_success[i]))
+                    episode_success[i] = False
+
+                    add = (
+                        global_step >= config.warmup_steps
+                        and (len(expert_rewards) < config.expert_buffer_size or ep_return > expert_min_return)
+                    )
+                    if add:
+                        expert_rewards[episode_idx] = ep_return
+                        expert_data[episode_idx] = episode_dict
+                        if len(expert_rewards) > config.expert_buffer_size:
+                            worst_id = min(expert_rewards, key=expert_rewards.get)
+                            del expert_rewards[worst_id], expert_data[worst_id]
+                            expert_dirty = True
+                        else:
+                            replay_buffer["expert_slicer"].extend([episode_dict])
+                            expert_min_return = min(expert_min_return, ep_return)
+
+                    env_ep[i] = {"obs": [], "z": [], "action": [], "reward": [], "next_obs": [], "done": []}
+                    episode_idx += 1
+
+            # Rebuild expert buffer once per iteration instead of per-episode
+            if expert_dirty:
+                replay_buffer["expert_slicer"] = TrajectoryBuffer(
+                    capacity=config.expert_buffer_size, device="cpu", seq_length=config.model.seq_length
+                )
+                for d in expert_data.values():
+                    replay_buffer["expert_slicer"].extend([d])
+                expert_min_return = min(expert_rewards.values())
+
+            if config.use_wandb and step_ep_returns:
+                log_payload = {
+                    "metrics/episode_return": float(np.mean(step_ep_returns)),
+                    "metrics/episode_length": float(np.mean(step_ep_lengths)),
+                }
+                if step_ep_success:
+                    log_payload["metrics/episode_success"] = float(np.mean(step_ep_success))
+                wandb.log(log_payload, step=global_step)
+
+            if step_ep_returns:
+                pbar.set_postfix(
+                    task=f"{task_idx+1}/{len(task_list)} {current_task}",
+                    ep_return=f"{step_ep_returns[-1]:.2f}",
+                    avg_r=f"{np.mean(last_n_rewards):.3f}" if last_n_rewards else "n/a",
+                )
 
             obs = next_obs
 
-            # --- episode termination ---
-            if terminated or truncated:
-                T = len(obs_list)
-                episode_dict = {
-                    "observation": np.concatenate(obs_list, axis=0).astype(np.float32),
-                    "action": np.concatenate(action_list, axis=0).astype(np.float32),
-                    "z": np.concatenate(z_list, axis=0).astype(np.float32),
-                    "reward": np.asarray(reward_list, dtype=np.float32).reshape(T, 1),
-                    "next": {
-                        "observation": np.concatenate(next_obs_list, axis=0).astype(np.float32),
-                        "terminated": np.asarray(done_list, dtype=np.bool_).reshape(T, 1),
-                    },
-                }
-                replay_buffer["train"].extend(episode_dict)
+        envs.close()
+        print(f"[Task {task_idx+1}/{len(task_list)}] Finished task '{current_task}' at global_step={global_step}, "
+              f"episodes={episode_idx}, train_buf={len(replay_buffer['train'])}, "
+              f"expert_buf={len(replay_buffer['expert_slicer'])}")
 
-                # Expert buffer: only add after warmup so it isn't filled with random trajectories
-                add = (
-                    global_step >= config.warmup_steps
-                    and (
-                        len(expert_rewards) < config.expert_buffer_max
-                        or (expert_rewards and episode_return > min(expert_rewards.values()))
-                    )
-                )
-                if add:
-                    replay_buffer["expert_slicer"].extend([episode_dict])
-                    expert_rewards[episode_idx] = episode_return
-                    expert_data[episode_idx] = episode_dict
+        if config.do_eval and reward_tracker is not None:
+            eval_rewards, eval_success = eval(agent, config, log_to_wandb=False)
+            eval_payload = {}
+            for j, tname in enumerate(task_list):
+                eval_payload[f"eval/reward/{tname}"] = float(eval_rewards[j])
+            eval_payload.update(reward_tracker.update(task_idx, eval_rewards))
 
-                # prune expert buffer once per episode, not every step
-                if len(expert_rewards) > config.expert_buffer_max:
-                    keep = dict(
-                        sorted(expert_rewards.items(), key=lambda x: x[1], reverse=True)[:config.expert_buffer_max]
-                    )
-                    replay_buffer["expert_slicer"] = TrajectoryBuffer(
-                        capacity=config.expert_buffer_size, device="cpu", seq_length=config.model.seq_length
-                    )
-                    for ep_id in keep:
-                        replay_buffer["expert_slicer"].extend([expert_data[ep_id]])
-                    expert_rewards = keep
-                    expert_data = {k: v for k, v in expert_data.items() if k in keep}
+            if success_tracker is not None and (has_success_eval or not np.all(np.isnan(eval_success))):
+                if not has_success_eval and not np.all(np.isnan(eval_success)):
+                    success_tracker.set_baseline(eval_success)
+                    has_success_eval = True
+                if has_success_eval:
+                    for j, tname in enumerate(task_list):
+                        if not np.isnan(eval_success[j]):
+                            eval_payload[f"eval/success/{tname}"] = float(eval_success[j])
+                    eval_payload.update(success_tracker.update(task_idx, eval_success))
 
-                pbar.set_postfix(
-                    task=f"{task_idx+1}/{len(task_list)} {current_task}",
-                    ep_return=f"{episode_return:.2f}",
-                    avg_r=f"{np.mean(last_n_rewards):.3f}",
-                )
-
-                if config.use_wandb:
-                    wandb.log({"train/episode_return": episode_return}, step=global_step)
-
-                if config.use_wandb and config.log_freq > 0 and global_step % config.log_freq == 0:
-                    wandb.log(
-                        {
-                            "train/last_n_rewards": np.sum(last_n_rewards),
-                            "train/task_id": task_idx,
-                        },
-                        step=global_step,
-                    )
-
-                episode_return = 0.0
-                obs_list, z_list, action_list, reward_list, next_obs_list, done_list = [], [], [], [], [], []
-                episode_idx += 1
-
-                obs, _ = env.reset()
-                terminated = truncated = False
-                episode_steps = 0
+            if config.use_wandb:
+                wandb.log(eval_payload, step=global_step)
 
     pbar.close()
-
-
-
-
